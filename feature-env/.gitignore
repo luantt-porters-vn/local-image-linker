@@ -1,8 +1,0 @@
-# Configuration and captured cluster state are private to each developer's machine.
-.env
-.env.local
-.feature-env/
-.feature-env.lock
-# Generated Python caches and handoff archives are not source files.
-__pycache__/
-*.zip
