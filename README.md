@@ -34,6 +34,37 @@ sudo apt-get update && sudo apt-get install -y git python3
 
 No `pip install` is needed — the script only uses Python's standard library.
 
+### `ui` and `api-client-privateapi` must bind-mount, not clone into a volume
+
+This tool builds from your host/WSL path in `FEATURE_ENV_*_REPO`, never from
+inside a Dev Container. `api-client-privateapi`'s Dev Container already binds
+your local folder. `ui`'s may still clone into an internal Docker volume
+instead — in that case, your edits stay in the volume and never reach the
+host path, so this tool builds stale code. Fix `ui/.devcontainer/devcontainer.json`:
+
+```jsonc
+// Before (wrong — clones into a volume):
+"workspaceMount": "source=hrbc-ui,target=/workspaces/hrbc-ui-react,type=volume",
+
+// After (correct — binds your local folder):
+"workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/hrbc-ui-react,type=bind,consistency=cached",
+```
+
+Then delete any `git clone` of the same repo in `ui/.devcontainer/post-create.sh`
+(a bind mount already has the checkout; re-cloning would overwrite it), and
+rebuild the Dev Container.
+
+`api-client-privateapi/.devcontainer/devcontainer.json` should already look
+like this (uses `src=`/`dst=` instead of `source=`/`target=`, same idea):
+
+```jsonc
+// Before (wrong — clones into a volume):
+"workspaceMount": "src=api-client-private,dst=/workspaces/api-client-private,type=volume",
+
+// After (correct — binds your local folder):
+"workspaceMount": "src=${localWorkspaceFolder},dst=/workspaces/api-client-private,type=bind,consistency=cached",
+```
+
 ## 2. One-Time Setup
 
 1. Create `.env` in this folder (`local-image-linker/src`) with the absolute path to
@@ -45,6 +76,7 @@ No `pip install` is needed — the script only uses Python's standard library.
    FEATURE_ENV_HRBC_REPO="$HOME/work/hrbc"
    FEATURE_ENV_CLIENT_REPO="$HOME/work/api-client-privateapi"
    FEATURE_ENV_STATE_DIR=".feature-env"
+   FEATURE_ENV_RELEASE="9-3-0"
    ```
 
 2. Make sure your HRBC cluster is already running (start it the same way you
@@ -170,3 +202,6 @@ bash run/build.sh --only web --env-file "$HOME/my-hrbc.env"
 bash run/deploy.sh --only web --env-file "$HOME/my-hrbc.env"
 bash run/restore.sh --only web --env-file "$HOME/my-hrbc.env"
 ```
+
+`--release` defaults to `FEATURE_ENV_RELEASE` from `.env` (falling back to
+`9-3-0` if unset); passing `--release` on the command line always overrides it.
