@@ -1,4 +1,4 @@
-# Run Local Images — User Manual
+# Run Local Images
 
 Build your local HRBC source (`ui`, `openapi-proxy`, `hrbc`, `api-client-privateapi`)
 into Docker images and swap them into an **already-running** HRBC cluster, so you can
@@ -15,6 +15,24 @@ complements the Dev Container workflow; it does not replace it for day-to-day co
 - An existing HRBC cluster already started (e.g. the "Start Cluster" VS Code task)
 - Private registry access, and a container mounting `devcontainer-settings`
 - VS Code, with this repository (`images-linker`) opened as a folder
+
+If you already have **Docker Desktop**, nothing to install there.
+
+Checking **inside your WSL distro** (or Windows if you store your local repos in here), is
+Git and Python, since `feature-env.py` runs there via Bash:
+
+```bash
+git --version           # any recent version works
+python3 --version       # needs 3.9+
+```
+
+If either is missing, install it in WSL (Debian/Ubuntu):
+
+```bash
+sudo apt-get update && sudo apt-get install -y git python3
+```
+
+No `pip install` is needed — the script only uses Python's standard library.
 
 ## 2. One-Time Setup
 
@@ -91,10 +109,7 @@ relevant log.
 - **Build fails** — fix it before running Deploy; the previous working images
   stay deployed and the log path is printed in the error.
 
-## 5. Privacy
 
-Share the GitHub repository only. Your `.env`, state, logs and source snapshots
-must stay private and uncommitted. Keep existing restore state.
 
 ## Extra: Running The Scripts Directly
 
