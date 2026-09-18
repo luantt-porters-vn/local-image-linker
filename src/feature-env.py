@@ -31,7 +31,7 @@ TARGETS.update({'openapi-proxy': ('proxy',), 'hrbc': ('api', 'web'), 'api-client
 
 def load_environment(path):
     """Parse allowed path settings as data; exported environment values take precedence."""
-    allowed = set(REPO_ENV.values()) | {'FEATURE_ENV_STATE_DIR'}
+    allowed = set(REPO_ENV.values()) | {'FEATURE_ENV_STATE_DIR', 'FEATURE_ENV_RELEASE'}
     values = {}
     if path.is_file():
         for number, line in enumerate(path.read_text().splitlines(), 1):
@@ -49,7 +49,11 @@ def load_environment(path):
         for key, value in values.items():
             if not value and key in REPO_ENV.values() and key not in os.environ:
                 os.environ[key] = ''
-            if value and key not in os.environ:
+            elif key == 'FEATURE_ENV_RELEASE':
+                # Not a filesystem path; keep the raw release string as-is.
+                if value and key not in os.environ:
+                    os.environ[key] = value
+            elif value and key not in os.environ:
                 resolved = Path(os.path.expandvars(value)).expanduser()
                 os.environ[key] = str((path.parent / resolved).resolve())
 
@@ -555,7 +559,7 @@ def main():
     parser.add_argument('command', choices=['prepare', 'paths', 'build', 'up', 'restore', 'stop', 'status', 'clean'])
     parser.add_argument('--env-file', type=Path, help='Configuration file; defaults to .env beside this script')
     parser.add_argument('--source', default='hrbc1')
-    parser.add_argument('--release', default='9-3-0')
+    parser.add_argument('--release', default=None, help='Compose cluster release; defaults to FEATURE_ENV_RELEASE in .env, then 9-3-0')
     parser.add_argument('--settings-container', help='Existing stopped container mounting devcontainer-settings')
     parser.add_argument('--repos', help='Fallback parent of the four repositories; FEATURE_ENV_*_REPO variables override individual paths')
     parser.add_argument('--add-host', action='append', default=[], help='Optional build-only hostname:IP mapping for VPN/Docker DNS')
@@ -572,6 +576,8 @@ def main():
         raise ValueError(f'Environment file not found: {env_file}. Create and edit it using the README configuration before running this command.')
     load_environment(env_file)
     STATE = Path(os.environ.get('FEATURE_ENV_STATE_DIR', str(BUNDLE / '.feature-env'))).expanduser().resolve()
+    if args.release is None:
+        args.release = os.environ.get('FEATURE_ENV_RELEASE', '9-3-0')
     print(f'Configuration: {env_file if env_file.is_file() else "process environment/defaults"}\nState: {STATE}', flush=True)
     if args.command == 'prepare' and (args.only or args.exclude):
         parser.error('prepare captures the whole cluster; selection applies to paths/build/up/restore/stop/status')

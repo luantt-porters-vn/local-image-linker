@@ -76,6 +76,7 @@ like this (uses `src=`/`dst=` instead of `source=`/`target=`, same idea):
    FEATURE_ENV_HRBC_REPO="$HOME/work/hrbc"
    FEATURE_ENV_CLIENT_REPO="$HOME/work/api-client-privateapi"
    FEATURE_ENV_STATE_DIR=".feature-env"
+   FEATURE_ENV_RELEASE="9-3-0"
    ```
 
 2. Make sure your HRBC cluster is already running (start it the same way you
@@ -201,3 +202,6 @@ bash run/build.sh --only web --env-file "$HOME/my-hrbc.env"
 bash run/deploy.sh --only web --env-file "$HOME/my-hrbc.env"
 bash run/restore.sh --only web --env-file "$HOME/my-hrbc.env"
 ```
+
+`--release` defaults to `FEATURE_ENV_RELEASE` from `.env` (falling back to
+`9-3-0` if unset); passing `--release` on the command line always overrides it.
