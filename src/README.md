@@ -14,14 +14,12 @@ complements the Dev Container workflow; it does not replace it for day-to-day co
 - Docker with BuildKit, and Compose supporting `up --wait` and `config --format json`
 - An existing HRBC cluster already started (e.g. the "Start Cluster" VS Code task)
 - Private registry access, and a container mounting `devcontainer-settings`
-
-Shell launchers are in `run/`; Dockerfiles are in `docker/`. Everything resolves
-paths from its own location, so you can run these commands from any directory,
-but this manual assumes `cd` into this folder (`images-linker/src`) first.
+- VS Code, with this repository (`images-linker`) opened as a folder
 
 ## 2. One-Time Setup
 
-1. Create `.env` in this folder with the absolute path to each of your local checkouts:
+1. Create `.env` in this folder (`images-linker/src`) with the absolute path to
+   each of your local checkouts:
 
    ```dotenv
    FEATURE_ENV_UI_REPO="$HOME/work/ui"
@@ -31,56 +29,83 @@ but this manual assumes `cd` into this folder (`images-linker/src`) first.
    FEATURE_ENV_STATE_DIR=".feature-env"
    ```
 
-2. Check the paths resolve correctly:
+2. Make sure your HRBC cluster is already running (start it the same way you
+   would for Dev Container work). This tool only replaces containers in an
+   existing cluster; it never creates one.
 
-   ```bash
-   bash run/feature-env.sh paths
-   ```
+If you move this folder after your first deploy, set `FEATURE_ENV_STATE_DIR` to
+the absolute path of your existing state directory instead of starting over —
+relative paths resolve beside `.env` and change meaning after a move. The saved
+state holds the original images needed for **Restore**; do not delete it.
 
-3. Make sure your HRBC cluster is already running (start it the same way you would
-   for Dev Container work). This tool only replaces containers in an existing cluster.
+## 3. Using The VS Code Tasks
 
-If you move this folder after your first deploy, set `FEATURE_ENV_STATE_DIR` to the
-absolute path of your existing state directory instead of re-preparing — relative
-paths resolve beside `.env` and change meaning after a move. The saved state holds
-the original images needed for `restore`; do not delete it.
+Open the **Command Palette ▸ Tasks: Run Task**, then pick one of the tasks below.
+Most tasks prompt with a dropdown for an optional target (`ui`, `proxy`, `api`,
+`web`, `hrbc`, `api-client-privateapi`); leave it blank to select all services.
 
-## 3. Everyday Workflow
+| Task | What it does |
+| --- | --- |
+| **Images Linker: Build** | Snapshots your working trees and runs `docker build` for the selected target(s). Does not deploy anything yet. |
+| **Images Linker: Deploy** | Swaps the selected running containers to the last built local images and waits for their health checks. |
+| **Images Linker: Restore** | Puts the selected services back on their original saved images. Database data is untouched. |
+| **Images Linker: Status** | Shows each selected service's container health and which image/commit it's currently running. |
+| **Images Linker: Stop** | Stops the selected containers without changing their configured image. |
+| **Images Linker: Clean Images (Preview)** | Lists unused local images and stale build snapshots without removing anything. |
+| **Images Linker: Clean Images (Remove)** | Actually removes those unused local images and stale build snapshots. |
+
+### Everyday workflow
 
 1. Edit code as usual in `ui`, `openapi-proxy`, `hrbc`, or `api-client-privateapi`
    (committed or just saved on disk — both are picked up).
 2. If a Dev Container is currently network-connected to a service you're about to
-   replace, disconnect it first (its existing network-disconnect task) — deploy
+   replace, disconnect it first (its existing network-disconnect task) — Deploy
    refuses to proceed while another container still holds that DNS alias.
-3. Build, then deploy:
-
-   ```bash
-   bash run/build.sh --only ui
-   bash run/deploy.sh --only ui
-   ```
-
-   The first build ever automatically captures the cluster's original images as a
-   restore baseline; it does not replace any container by itself. `build` only
-   produces an image — you always need `deploy` afterward to swap it in.
-4. Test against the cluster as normal.
-5. When finished, put the original image back:
-
-   ```bash
-   bash run/restore.sh --only ui
-   ```
-
-Repeat step 3 every time you want your latest changes reflected — there is no
-watch mode; each run is a fresh snapshot and a fresh `docker build`.
+3. Run task **Images Linker: Build**, choosing your target — the first build ever
+   automatically captures the cluster's original images as a restore baseline. It
+   does not replace any container by itself.
+4. Run task **Images Linker: Deploy** with the same target to swap it into the
+   cluster, then test as normal.
+5. Repeat steps 1, 3, 4 every time you want your latest changes reflected — there
+   is no watch mode; each run is a fresh snapshot and a fresh `docker build`.
+6. When finished, run task **Images Linker: Restore** with the same target to put
+   the original image back.
 
 ### What you'll see during a build
 
-Progress updates in place in an interactive terminal, one row per image, showing
-status, elapsed time, and the current Docker step. When output is redirected (or
-`TERM=dumb`), it instead prints status changes and a progress line every 15
-seconds. Full Docker output is saved to `builds/<build-id>/<target>.log`; a
-failure message includes the path to the relevant log.
+The task's terminal updates in place, one row per image, showing status, elapsed
+time, and the current Docker step. Full Docker output is saved to
+`builds/<build-id>/<target>.log`; a failure message includes the path to the
+relevant log.
 
-## 4. Selecting Services
+## 4. Troubleshooting
+
+- **"Another feature-env command is running"** — a previous Build/Deploy/Restore
+  task is still holding the lock file; wait for it to finish or check for a
+  stuck process.
+- **"... still redirects ..."** during Deploy — a Dev Container is still
+  network-connected to that service; disconnect it first, then retry.
+- **"No prepared cluster state"** — run Build successfully at least once before
+  Deploy/Restore/Status; if you moved the folder, set `FEATURE_ENV_STATE_DIR`
+  instead of starting over.
+- **Build fails** — fix it before running Deploy; the previous working images
+  stay deployed and the log path is printed in the error.
+
+## 5. Privacy
+
+Share the GitHub repository only. Your `.env`, state, logs and source snapshots
+must stay private and uncommitted. Keep existing restore state.
+
+## Extra: Running The Scripts Directly
+
+The tasks above just call the shell launchers in `run/`; you can run the same
+commands yourself from a terminal, from this folder (`images-linker/src`).
+
+`run/feature-env.sh` is the shared launcher for the Python implementation. The
+build, deploy, and restore scripts call it with their command; use it directly
+for `paths`, `status`, `stop`, and `clean`.
+
+### Selecting services
 
 Targets: `ui`, `openapi-proxy` (or `proxy`), `api`, `web`, `hrbc` (alias for `api`
 + `web`), `api-client-privateapi` (alias for `ui`, since it's bundled into the UI
@@ -89,7 +114,6 @@ services are selected. Repeat your selection on every command — it is not
 remembered between `build`, `deploy`, and `restore`.
 
 ```bash
-# Only selected services
 bash run/build.sh --only web
 bash run/deploy.sh --only web
 
@@ -104,15 +128,11 @@ bash run/restore.sh --only ui openapi-proxy
 bash run/build.sh --exclude ui
 bash run/deploy.sh --exclude ui
 
-bash run/build.sh --exclude ui openapi-proxy
-bash run/deploy.sh --exclude ui openapi-proxy
-
 # Restore without touching excluded services
 bash run/restore.sh --exclude ui
-bash run/restore.sh --exclude ui openapi-proxy
 ```
 
-## 5. Command Reference
+### Command reference
 
 | Command | What it does |
 | --- | --- |
@@ -121,7 +141,7 @@ bash run/restore.sh --exclude ui openapi-proxy
 | `bash run/restore.sh [--only/--exclude ...]` | Put selected services back on their original saved images. Database data is untouched. |
 | `bash run/feature-env.sh status [--only/--exclude ...]` | Show each selected service's container health and which image/commit it's running. |
 | `bash run/feature-env.sh stop [--only/--exclude ...]` | Stop selected containers without changing their configured image. |
-| `bash run/clean.sh [--dry-run] [--only/--exclude ...] [--keep-builds N]` | Remove unused local images and old build snapshots (see below). |
+| `bash run/clean.sh [--dry-run] [--only/--exclude ...] [--keep-builds N]` | Remove unused local images and old build snapshots. |
 | `bash run/feature-env.sh paths [--only/--exclude ...]` | Print the repository path resolved for each target, without touching Docker. |
 
 ### Useful options
@@ -135,41 +155,3 @@ bash run/build.sh --only web --env-file "$HOME/my-hrbc.env"
 bash run/deploy.sh --only web --env-file "$HOME/my-hrbc.env"
 bash run/restore.sh --only web --env-file "$HOME/my-hrbc.env"
 ```
-
-## 6. Clean Up Local Images
-
-Built images and build snapshots (`.feature-env/builds/<id>/`) accumulate on disk
-over time. `clean` removes local images that are neither currently deployed nor
-recorded as the latest build, and deletes old build snapshot folders beyond
-`--keep-builds` (default 2 per target selection):
-
-```bash
-bash run/clean.sh --dry-run       # preview what would be removed
-bash run/clean.sh                 # actually remove it
-bash run/clean.sh --only web --keep-builds 1
-```
-
-## 7. VS Code Tasks
-
-Open this folder (`images-linker`) in VS Code and use **Terminal ▸ Run Task** to
-run `build`, `deploy`, `restore`, `status`, `stop`, and `clean` (preview/remove)
-without typing commands. Each task prompts for an optional `--only` target from a
-dropdown; leave it blank to target all services.
-
-## 8. Troubleshooting
-
-- **"Another feature-env command is running"** — a previous `build`/`deploy`/
-  `restore` is still holding the lock file; wait for it to finish or check for a
-  stuck process.
-- **"... still redirects ..."** during deploy — a Dev Container is still
-  network-connected to that service; disconnect it first, then retry.
-- **"No prepared cluster state"** — run `build` successfully at least once before
-  `deploy`/`restore`/`status`; if you moved the folder, set `FEATURE_ENV_STATE_DIR`
-  instead of re-preparing.
-- **Build fails** — fix it before running `deploy`; the previous working images
-  stay deployed and the log path is printed in the error.
-
-## 9. Privacy
-
-Share the GitHub repository only. Your `.env`, state, logs and source snapshots
-must stay private and uncommitted. Keep existing restore state.
