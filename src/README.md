@@ -43,6 +43,12 @@ bash run/build.sh
 bash run/deploy.sh
 ```
 
+Build progress updates in place in an interactive terminal, with one row per
+image showing its status, elapsed time, and current Docker step. When output is
+redirected (or `TERM=dumb`), it prints status changes and a progress update every
+15 seconds instead. Full Docker output is saved in the displayed
+`builds/<build-id>/<target>.log` files; failures include the relevant log path.
+
 ## Restore
 
 Return to saved normal application images, without rolling back the database:
@@ -99,6 +105,24 @@ bash run/feature-env.sh status
 bash run/feature-env.sh status --only web
 bash run/feature-env.sh stop --exclude ui
 ```
+
+## Clean Up Local Images
+
+Built images and build snapshots (`.feature-env/builds/<id>/`) accumulate on disk.
+`clean` removes local images not currently deployed or recorded as the latest
+build, and deletes old build snapshot folders beyond `--keep-builds` (default 2):
+
+```bash
+bash run/clean.sh --dry-run
+bash run/clean.sh
+bash run/clean.sh --only web --keep-builds 1
+```
+
+## VS Code Tasks
+
+Open this folder in VS Code and use Terminal > Run Task to run `build`, `deploy`,
+`restore`, `status`, `stop`, and `clean` (preview/remove) without typing commands;
+each prompts for an optional `--only` target.
 
 Share the GitHub repository only. Your `.env`, state, logs and source snapshots
 must stay private and uncommitted. Keep existing restore state.

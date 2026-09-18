@@ -222,6 +222,58 @@ def snapshot(repo, destination):
             d.chmod(0o755)
     return {'repository': str(repo), 'branch': output(['git', '-C', repo, 'branch', '--show-current']).strip() or 'detached', 'sha': output(['git', '-C', repo, 'rev-parse', 'HEAD']).strip(), 'dirty': bool(output(['git', '-C', repo, 'status', '--porcelain']).strip())}
 
+class BuildProgress:
+    """Render concurrent builds in fixed rows, or sparse messages outside a terminal."""
+
+    def __init__(self, targets, stream=None):
+        self.stream = stream if stream is not None else sys.stdout
+        self.tty = self.stream.isatty() and os.environ.get('TERM') != 'dumb'
+        self.rows = {key: {'status': 'Queued', 'step': '', 'started': None, 'ended': None}
+                     for key in targets}
+        self.lock = threading.Lock()
+        self.lines = 0
+        self.last_report = time.monotonic()
+
+    def update(self, key, status=None, step=None):
+        with self.lock:
+            row = self.rows[key]
+            if step is not None:
+                # Docker output must not inject terminal controls into the display.
+                row['step'] = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', step)
+            if status is not None:
+                row['status'] = status
+                if status == 'Building':
+                    row['started'] = time.monotonic()
+                elif status in ('Built', 'Failed', 'Cancelled'):
+                    row['ended'] = time.monotonic()
+                if not self.tty:
+                    print(self.format_row(key, row), file=self.stream, flush=True)
+
+    def format_row(self, key, row):
+        elapsed = '' if row['started'] is None else f"{int((row['ended'] or time.monotonic()) - row['started'])}s"
+        step = row['step'] if row['status'] == 'Building' else ''
+        return f"  {key:<7} {row['status']:<10} {elapsed:>6}  {step}".rstrip()
+
+    def render(self, final=False):
+        with self.lock:
+            if self.tty:
+                width = max(1, shutil.get_terminal_size().columns - 1)
+                done = sum(row['status'] == 'Built' for row in self.rows.values())
+                lines = [f'Building images [{done}/{len(self.rows)}]']
+                lines += [self.format_row(key, row) for key, row in self.rows.items()]
+                if self.lines:
+                    self.stream.write(f'\x1b[{self.lines}A')
+                for line in lines:
+                    self.stream.write('\r\x1b[2K' + line[:width] + '\n')
+                self.stream.flush()
+                self.lines = len(lines)
+            elif not final and time.monotonic() - self.last_report >= 15:
+                for key, row in self.rows.items():
+                    if row['status'] == 'Building':
+                        print(self.format_row(key, row), file=self.stream, flush=True)
+                self.last_report = time.monotonic()
+
+
 def build(args, state):
     """Build isolated snapshots concurrently; publish image selections only on success."""
     overall_started = time.monotonic()
@@ -258,6 +310,8 @@ def build(args, state):
         sha = metadata[key]['sha'][:12]
         images[key] = f'local/{state["project"]}-{key}:feature-{sha}-{build_id}'
     failed = threading.Event()
+    display = BuildProgress(args.targets)
+    print(f'Full build logs: {context}/<target>.log', flush=True)
     def one(key):
         if failed.is_set():
             raise ValueError('Cancelled after another build failed')
@@ -268,21 +322,17 @@ def build(args, state):
         if args.npmrc:
             cmd += ['--secret', 'id=npmrc,src=' + str(Path(args.npmrc).resolve())]
         cmd += [context]
-        print(f'Building {key}: {images[key]} (log: {logfile})', flush=True)
+        display.update(key, status='Building', step='Starting Docker')
         with logfile.open('w') as log:
             process = subprocess.Popen([str(x) for x in cmd], stdout=log, stderr=subprocess.STDOUT)
             started = time.monotonic()
-            last_update = started
             with logfile.open() as progress:
                 while True:
                     finished = process.poll() is not None
                     for line in progress.readlines():
-                        stage = re.match(r'(#\d+) \[([^\]]+)\]', line)
-                        result = re.match(r'(#\d+) (DONE|CACHED|ERROR)(?: |$)', line)
+                        stage = re.match(r'(#\d+) (\[[^\]]+\] .+|exporting .+)', line)
                         if stage:
-                            print(f'[{key}] {stage[1]} {stage[2]} | {int(time.monotonic() - started)}s elapsed', flush=True)
-                        elif result:
-                            print(f'[{key}] {result[1]} {result[2]}', flush=True)
+                            display.update(key, step=f'{stage[1]} {stage[2].strip()}')
                     if finished:
                         break
                     if failed.is_set() or time.monotonic() - started > 1800:
@@ -293,24 +343,41 @@ def build(args, state):
                             process.kill()
                             process.wait()
                         raise ValueError(f'{key}: build cancelled or timed out')
-                    if time.monotonic() - last_update >= 15:
-                        print(f'[{key}] Still building | {int(time.monotonic() - started)}s elapsed | log: {logfile}', flush=True)
-                        last_update = time.monotonic()
                     time.sleep(0.5)
             if process.returncode:
-                failed.set()
                 raise ValueError(f'{key}: Docker build failed')
-        print(f'Built {key} in {int(time.monotonic() - started)}s', flush=True)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures = {pool.submit(one, key): key for key in args.targets}
-        for f in concurrent.futures.as_completed(futures):
-            try:
-                f.result()
-            except BaseException:
-                failed.set()
-                for pending in futures:
-                    pending.cancel()
-                raise ValueError(f'Build failed for {futures[f]}: {f.exception()}. Saved deployment images unchanged. Full log: {context / (futures[f] + ".log")}')
+        display.update(key, status='Built')
+    def tracked(key):
+        try:
+            one(key)
+        except BaseException:
+            display.update(key, status='Cancelled' if failed.is_set() else 'Failed')
+            failed.set()
+            raise
+
+    display.render()
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            futures = {pool.submit(tracked, key): key for key in args.targets}
+            pending = set(futures)
+            errors = []
+            while pending:
+                completed, pending = concurrent.futures.wait(
+                    pending, timeout=0.2, return_when=concurrent.futures.FIRST_COMPLETED)
+                for future in completed:
+                    if future.cancelled():
+                        display.update(futures[future], status='Cancelled')
+                    elif future.exception() is not None:
+                        errors.append((futures[future], future.exception()))
+                        failed.set()
+                        for waiting in pending:
+                            waiting.cancel()
+                display.render()
+            if errors:
+                key, error = errors[0]
+                raise ValueError(f'Build failed for {key}: {error}. Saved deployment images unchanged. Full log: {context / (key + ".log")}')
+    finally:
+        display.render(final=True)
     previous = json.loads((STATE / 'build.json').read_text()) if (STATE / 'build.json').exists() else {}
     all_images = {**previous.get('images', {}), **images}
     all_metadata = {**previous.get('repositories', {}), **metadata}
@@ -417,6 +484,49 @@ def refresh_web_routing(state):
                                 '--wait', '--wait-timeout', '180', '--pull', 'never', 'hrbcweblb'])
 
 
+def clean(state, targets, keep_builds, dry_run):
+    """Remove local feature images and stale build snapshots no longer referenced by saved state."""
+    build_info = json.loads((STATE / 'build.json').read_text()) if (STATE / 'build.json').exists() else {'images': {}, 'build_id': None}
+    feature_info = json.loads((STATE / 'feature.json').read_text()) if (STATE / 'feature.json').exists() else {'services': {}}
+    keep_images = set()
+    for key in targets:
+        service = SERVICES[key]
+        if service in feature_info['services']:
+            keep_images.add(feature_info['services'][service]['image'])
+        if key in build_info['images']:
+            keep_images.add(build_info['images'][key])
+        try:
+            keep_images.add(inspect(f"{state['project']}-{service}-1")['Config']['Image'])
+        except subprocess.CalledProcessError:
+            pass
+    existing = output(['docker', 'images', '--format', '{{.Repository}}:{{.Tag}}',
+                        '--filter', f'reference=local/{state["project"]}-*']).split()
+    removable = sorted(set(existing) - keep_images)
+    verb = 'Would remove' if dry_run else 'Removing'
+    if removable:
+        print(f'{verb} unused local images:')
+        for image in removable:
+            print(' ', image)
+        if not dry_run:
+            subprocess.run(['docker', 'rmi'] + removable, check=False)
+    else:
+        print('No unused local images to remove.')
+    builds_dir = STATE / 'builds'
+    all_builds = sorted((p for p in builds_dir.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime) if builds_dir.exists() else []
+    boundary = len(all_builds) - keep_builds if keep_builds > 0 else 0
+    stale_builds = [p for p in all_builds[:max(boundary, 0)] if p.name != build_info.get('build_id')]
+    if stale_builds:
+        print(f'{verb} stale build snapshots:')
+        for path in stale_builds:
+            print(' ', path)
+            if not dry_run:
+                shutil.rmtree(path)
+    else:
+        print('No stale build snapshots to remove.')
+    if not dry_run:
+        subprocess.run(['docker', 'image', 'prune', '-f'], check=False)
+
+
 def deploy(state, targets):
     """Replace only selected apps, check health, then refresh shared load-balancer routing."""
     feature = json.loads((STATE / 'feature.json').read_text())
@@ -442,7 +552,7 @@ def main():
     global STATE
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['prepare', 'paths', 'build', 'up', 'restore', 'stop', 'status'])
+    parser.add_argument('command', choices=['prepare', 'paths', 'build', 'up', 'restore', 'stop', 'status', 'clean'])
     parser.add_argument('--env-file', type=Path, help='Configuration file; defaults to .env beside this script')
     parser.add_argument('--source', default='hrbc1')
     parser.add_argument('--release', default='9-3-0')
@@ -451,6 +561,8 @@ def main():
     parser.add_argument('--add-host', action='append', default=[], help='Optional build-only hostname:IP mapping for VPN/Docker DNS')
     parser.add_argument('--npmrc', help='Private npm config mounted as a BuildKit secret')
     parser.add_argument('--jobs', type=int, choices=range(1, 5), default=2)
+    parser.add_argument('--dry-run', action='store_true', help='clean: list what would be removed without removing it')
+    parser.add_argument('--keep-builds', type=int, default=2, help='clean: most recent build snapshots to retain per target selection')
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument('--only', nargs='+', choices=TARGETS, help='Build/manage only these repositories or runtime targets')
     selection.add_argument('--exclude', nargs='+', choices=TARGETS, help='Leave these repositories or runtime targets to Dev Containers')
@@ -509,6 +621,8 @@ def main():
         run(['docker', 'restart', state['project'] + '-hrbcprivateapicore-1', state['project'] + '-hrbcweblb-1'])
     elif args.command == 'stop':
         run(compose(state, False) + ['stop', *[SERVICES[key] for key in args.targets]])
+    elif args.command == 'clean':
+        clean(state, args.targets, args.keep_builds, args.dry_run)
     else:
         summary(state, args.targets)
 

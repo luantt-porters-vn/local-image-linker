@@ -1,0 +1,89 @@
+{
+    // See https://go.microsoft.com/fwlink/?LinkId=733558
+    // for the documentation about the tasks.json format
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Images Linker: Build",
+            "type": "shell",
+            "command": "bash \"${workspaceFolder}/src/run/build.sh\" ${ONLY:+--only $ONLY}",
+            "options": {
+                "env": { "ONLY": "${input:imagesLinkerOnly}" }
+            },
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "Images Linker: Deploy",
+            "type": "shell",
+            "command": "bash \"${workspaceFolder}/src/run/deploy.sh\" ${ONLY:+--only $ONLY}",
+            "options": {
+                "env": { "ONLY": "${input:imagesLinkerOnly}" }
+            },
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "Images Linker: Restore",
+            "type": "shell",
+            "command": "bash \"${workspaceFolder}/src/run/restore.sh\" ${ONLY:+--only $ONLY}",
+            "options": {
+                "env": { "ONLY": "${input:imagesLinkerOnly}" }
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Images Linker: Status",
+            "type": "shell",
+            "command": "bash \"${workspaceFolder}/src/run/feature-env.sh\" status ${ONLY:+--only $ONLY}",
+            "options": {
+                "env": { "ONLY": "${input:imagesLinkerOnly}" }
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Images Linker: Stop",
+            "type": "shell",
+            "command": "bash \"${workspaceFolder}/src/run/feature-env.sh\" stop ${ONLY:+--only $ONLY}",
+            "options": {
+                "env": { "ONLY": "${input:imagesLinkerOnly}" }
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Images Linker: Clean Images (Preview)",
+            "type": "shell",
+            "command": "bash \"${workspaceFolder}/src/run/clean.sh\" --dry-run ${ONLY:+--only $ONLY}",
+            "options": {
+                "env": { "ONLY": "${input:imagesLinkerOnly}" }
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Images Linker: Clean Images (Remove)",
+            "type": "shell",
+            "command": "bash \"${workspaceFolder}/src/run/clean.sh\" ${ONLY:+--only $ONLY}",
+            "options": {
+                "env": { "ONLY": "${input:imagesLinkerOnly}" }
+            },
+            "problemMatcher": []
+        }
+    ],
+    "inputs": [
+        {
+            "id": "imagesLinkerOnly",
+            "type": "pickString",
+            "description": "--only selector (blank = all targets)",
+            "options": [
+                "",
+                "ui",
+                "proxy",
+                "api",
+                "web",
+                "hrbc",
+                "api-client-privateapi"
+            ],
+            "default": ""
+        }
+    ]
+}
