@@ -1,4 +1,4 @@
-# images-linker: Repository Explanation
+# local-image-linker: Repository Explanation
 
 This guide explains the checked-out source as inspected on 2026-09-16. Code blocks marked **Source** are exact excerpts, including the repository's original comments; explanations appear below them. Directory trees, flow maps, and explicitly labeled examples are explanatory illustrations.
 
@@ -6,7 +6,7 @@ The guide is based on reading the implementation. No build, deployment, restore,
 
 ## 1. High-Level Overview
 
-`images-linker` packages saved local HRBC source code into Docker images and switches selected services in an existing local Docker Compose environment to those images. It records the original application image references and configuration so the services can later be restored. The repository is a command-line orchestration tool; the business applications it builds live in other repositories.
+`local-image-linker` packages saved local HRBC source code into Docker images and switches selected services in an existing local Docker Compose environment to those images. It records the original application image references and configuration so the services can later be restored. The repository is a command-line orchestration tool; the business applications it builds live in other repositories.
 
 The central connection between application names, Compose services, and source repositories is defined here:
 
@@ -47,7 +47,7 @@ The Python program has no third-party Python imports or package installation ste
 ## 2. Directory & Module Blueprint
 
 ```text
-images-linker/
+local-image-linker/
 ├── REPOSITORY_EXPLANATION.md      # This guide
 └── src/
     ├── README.md                 # Operator commands and configuration example

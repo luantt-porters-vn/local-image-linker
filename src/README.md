@@ -14,7 +14,7 @@ complements the Dev Container workflow; it does not replace it for day-to-day co
 - Docker with BuildKit, and Compose supporting `up --wait` and `config --format json`
 - An existing HRBC cluster already started (e.g. the "Start Cluster" VS Code task)
 - Private registry access, and a container mounting `devcontainer-settings`
-- VS Code, with this repository (`images-linker`) opened as a folder
+- VS Code, with this repository (`local-image-linker`) opened as a folder
 
 If you already have **Docker Desktop**, nothing to install there.
 
@@ -36,7 +36,7 @@ No `pip install` is needed — the script only uses Python's standard library.
 
 ## 2. One-Time Setup
 
-1. Create `.env` in this folder (`images-linker/src`) with the absolute path to
+1. Create `.env` in this folder (`local-image-linker/src`) with the absolute path to
    each of your local checkouts:
 
    ```dotenv
@@ -64,13 +64,13 @@ Most tasks prompt with a dropdown for an optional target (`ui`, `proxy`, `api`,
 
 | Task | What it does |
 | --- | --- |
-| **Images Linker: Build** | Snapshots your working trees and runs `docker build` for the selected target(s). Does not deploy anything yet. |
-| **Images Linker: Deploy** | Swaps the selected running containers to the last built local images and waits for their health checks. |
-| **Images Linker: Restore** | Puts the selected services back on their original saved images. Database data is untouched. |
-| **Images Linker: Status** | Shows each selected service's container health and which image/commit it's currently running. |
-| **Images Linker: Stop** | Stops the selected containers without changing their configured image. |
-| **Images Linker: Clean Images (Preview)** | Lists unused local images and stale build snapshots without removing anything. |
-| **Images Linker: Clean Images (Remove)** | Actually removes those unused local images and stale build snapshots. |
+| **Local Image Linker: Build** | Snapshots your working trees and runs `docker build` for the selected target(s). Does not deploy anything yet. |
+| **Local Image Linker: Deploy** | Swaps the selected running containers to the last built local images and waits for their health checks. |
+| **Local Image Linker: Restore** | Puts the selected services back on their original saved images. Database data is untouched. |
+| **Local Image Linker: Status** | Shows each selected service's container health and which image/commit it's currently running. |
+| **Local Image Linker: Stop** | Stops the selected containers without changing their configured image. |
+| **Local Image Linker: Clean Images (Preview)** | Lists unused local images and stale build snapshots without removing anything. |
+| **Local Image Linker: Clean Images (Remove)** | Actually removes those unused local images and stale build snapshots. |
 
 ### Everyday workflow
 
@@ -79,14 +79,14 @@ Most tasks prompt with a dropdown for an optional target (`ui`, `proxy`, `api`,
 2. If a Dev Container is currently network-connected to a service you're about to
    replace, disconnect it first (its existing network-disconnect task) — Deploy
    refuses to proceed while another container still holds that DNS alias.
-3. Run task **Images Linker: Build**, choosing your target — the first build ever
+3. Run task **Local Image Linker: Build**, choosing your target — the first build ever
    automatically captures the cluster's original images as a restore baseline. It
    does not replace any container by itself.
-4. Run task **Images Linker: Deploy** with the same target to swap it into the
+4. Run task **Local Image Linker: Deploy** with the same target to swap it into the
    cluster, then test as normal.
 5. Repeat steps 1, 3, 4 every time you want your latest changes reflected — there
    is no watch mode; each run is a fresh snapshot and a fresh `docker build`.
-6. When finished, run task **Images Linker: Restore** with the same target to put
+6. When finished, run task **Local Image Linker: Restore** with the same target to put
    the original image back.
 
 ### What you'll see during a build
@@ -114,7 +114,7 @@ relevant log.
 ## Extra: Running The Scripts Directly
 
 The tasks above just call the shell launchers in `run/`; you can run the same
-commands yourself from a terminal, from this folder (`images-linker/src`).
+commands yourself from a terminal, from this folder (`local-image-linker/src`).
 
 `run/feature-env.sh` is the shared launcher for the Python implementation. The
 build, deploy, and restore scripts call it with their command; use it directly

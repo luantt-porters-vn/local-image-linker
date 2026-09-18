@@ -4,7 +4,7 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "Images Linker: Build",
+            "label": "Local Image Linker: Build",
             "type": "shell",
             "command": "bash \"${workspaceFolder}/src/run/build.sh\" ${ONLY:+--only $ONLY}",
             "options": {
@@ -14,7 +14,7 @@
             "problemMatcher": []
         },
         {
-            "label": "Images Linker: Deploy",
+            "label": "Local Image Linker: Deploy",
             "type": "shell",
             "command": "bash \"${workspaceFolder}/src/run/deploy.sh\" ${ONLY:+--only $ONLY}",
             "options": {
@@ -24,7 +24,7 @@
             "problemMatcher": []
         },
         {
-            "label": "Images Linker: Restore",
+            "label": "Local Image Linker: Restore",
             "type": "shell",
             "command": "bash \"${workspaceFolder}/src/run/restore.sh\" ${ONLY:+--only $ONLY}",
             "options": {
@@ -33,7 +33,7 @@
             "problemMatcher": []
         },
         {
-            "label": "Images Linker: Status",
+            "label": "Local Image Linker: Status",
             "type": "shell",
             "command": "bash \"${workspaceFolder}/src/run/feature-env.sh\" status ${ONLY:+--only $ONLY}",
             "options": {
@@ -42,7 +42,7 @@
             "problemMatcher": []
         },
         {
-            "label": "Images Linker: Stop",
+            "label": "Local Image Linker: Stop",
             "type": "shell",
             "command": "bash \"${workspaceFolder}/src/run/feature-env.sh\" stop ${ONLY:+--only $ONLY}",
             "options": {
@@ -51,7 +51,7 @@
             "problemMatcher": []
         },
         {
-            "label": "Images Linker: Clean Images (Preview)",
+            "label": "Local Image Linker: Clean Images (Preview)",
             "type": "shell",
             "command": "bash \"${workspaceFolder}/src/run/clean.sh\" --dry-run ${ONLY:+--only $ONLY}",
             "options": {
@@ -60,7 +60,7 @@
             "problemMatcher": []
         },
         {
-            "label": "Images Linker: Clean Images (Remove)",
+            "label": "Local Image Linker: Clean Images (Remove)",
             "type": "shell",
             "command": "bash \"${workspaceFolder}/src/run/clean.sh\" ${ONLY:+--only $ONLY}",
             "options": {
