@@ -38,9 +38,18 @@ No `pip install` is needed — the script only uses Python's standard library.
 
 This tool builds from your host/WSL path in `FEATURE_ENV_*_REPO`, never from
 inside a Dev Container. `api-client-privateapi`'s Dev Container already binds
-your local folder. `ui`'s may still clone into an internal Docker volume
-instead — in that case, your edits stay in the volume and never reach the
-host path, so this tool builds stale code. Fix `ui/.devcontainer/devcontainer.json`:
+your local folder. `ui`'s and `openapi-proxy`'s may still clone into an
+internal Docker volume instead — in that case, your edits stay in the volume
+and never reach the host path, so this tool builds stale code.
+
+The fix for both repos is the same: point `workspaceMount` at your local
+checkout with a `bind` mount instead of letting the container clone its own
+copy into a `volume`. A bind mount means the container's `/workspaces/...`
+folder *is* your host folder (edits go straight to disk, visible to this
+tool); a volume is a separate, container-managed copy that a `git clone`
+step populates once and your host-side edits never reach.
+
+Fix `ui/.devcontainer/devcontainer.json`:
 
 ```jsonc
 // Before (wrong — clones into a volume):
@@ -50,9 +59,23 @@ host path, so this tool builds stale code. Fix `ui/.devcontainer/devcontainer.js
 "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/hrbc-ui-react,type=bind,consistency=cached",
 ```
 
-Then delete any `git clone` of the same repo in `ui/.devcontainer/post-create.sh`
-(a bind mount already has the checkout; re-cloning would overwrite it), and
-rebuild the Dev Container.
+Fix `openapi-proxy/.devcontainer/devcontainer.json` the same way:
+
+```jsonc
+// Before (wrong — clones into a volume):
+"workspaceMount": "source=privateapi-web-proxy,target=/workspaces/privateapi-web-proxy,type=volume",
+
+// After (correct — binds your local folder):
+"workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/privateapi-web-proxy,type=bind",
+```
+
+Then, for each repo, delete any `git clone`/`[ -d /workspace... ]` line that
+re-clones that same repo inside `.devcontainer/post-create.sh` (a bind mount
+already has the checkout; re-cloning would overwrite your local edits with a
+fresh clone), and rebuild + reopen the Dev Container (Command Palette →
+**Dev Containers: Rebuild and Reopen in Container**) so the new
+`workspaceMount` takes effect — VS Code only reads `workspaceMount` when the
+container is (re)created, not on a simple reload.
 
 `api-client-privateapi/.devcontainer/devcontainer.json` should already look
 like this (uses `src=`/`dst=` instead of `source=`/`target=`, same idea):
@@ -76,7 +99,7 @@ like this (uses `src=`/`dst=` instead of `source=`/`target=`, same idea):
    FEATURE_ENV_HRBC_REPO="$HOME/work/hrbc"
    FEATURE_ENV_CLIENT_REPO="$HOME/work/api-client-privateapi"
    FEATURE_ENV_STATE_DIR=".feature-env"
-   FEATURE_ENV_RELEASE="9-3-0"
+   FEATURE_ENV_RELEASE="auto"
    ```
 
 2. Make sure your HRBC cluster is already running (start it the same way you
@@ -203,5 +226,14 @@ bash run/deploy.sh --only web --env-file "$HOME/my-hrbc.env"
 bash run/restore.sh --only web --env-file "$HOME/my-hrbc.env"
 ```
 
-`--release` defaults to `FEATURE_ENV_RELEASE` from `.env` (falling back to
-`9-3-0` if unset); passing `--release` on the command line always overrides it.
+`--release` overrides `FEATURE_ENV_RELEASE` from `.env`. Leave it blank or use
+`auto` to detect the running cluster's release from its published office image.
+An explicit version must match the running cluster; it does not upgrade the cluster.
+
+After starting a new cluster release with its published application images, run
+Build again. The tool backs up the old baseline, captures the upgraded cluster,
+and invalidates old build selections. Build each target before deploying it.
+If old local images are still running, restart the upgraded cluster with its
+published application images first; the tool will not capture local images as
+restore images. Existing builds without recorded release metadata also require
+a rebuild before Deploy. Restore refuses to use a baseline from a different release.

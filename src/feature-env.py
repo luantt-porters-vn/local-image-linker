@@ -18,6 +18,7 @@ import subprocess
 import sys
 import uuid
 import shlex
+import tempfile
 
 BUNDLE = Path(__file__).resolve().parent
 STATE = BUNDLE / '.feature-env'
@@ -92,6 +93,25 @@ def inspect(name):
     """Read the current Docker object's details instead of assuming runtime state."""
     return json.loads(output(['docker', 'inspect', name]))[0]
 
+def heal_stray_renames(state):
+    """Recover a container Compose left under its temporary swap name after an interrupted recreate."""
+    for service in SERVICES.values():
+        expected = state['project'] + '-' + service + '-1'
+        try:
+            inspect(expected)
+            continue
+        except subprocess.CalledProcessError:
+            pass
+        ids = output(['docker', 'ps', '-aq',
+                      '--filter', f'label=com.docker.compose.project={state["project"]}',
+                      '--filter', f'label=com.docker.compose.service={service}']).split()
+        if len(ids) != 1:
+            continue  # nothing to repair, or ambiguous; let the normal flow surface the error
+        current = inspect(ids[0])['Name'].lstrip('/')
+        if current != expected:
+            print(f'Repairing interrupted container swap: {current} -> {expected}', flush=True)
+            run(['docker', 'rename', current, expected])
+
 def repository_paths(state, targets, parent=None):
     """Resolve selected Git roots, including the local client whenever UI is selected."""
     base = Path(parent or state.get('repos', str(BUNDLE.parent / 'hrbc'))).expanduser().resolve()
@@ -117,6 +137,85 @@ def repository_paths(state, targets, parent=None):
             raise ValueError(f'{variable}: use the repository root {top}, not {repo}')
         paths[key] = repo
     return paths
+
+def image_release(image):
+    """Read the HRBC release from published runtime tags, never from local source."""
+    match = re.search(r'-H([0-9]+(?:\.[0-9]+)+)$', image)
+    return match[1].replace('.', '-') if match else None
+
+
+def cluster_release(project, requested=None):
+    """Office is not replaced by local builds, so it remains the cluster release anchor."""
+    image = inspect(f'{project}-hrbcoffice-1')['Config']['Image']
+    detected = image_release(image)
+    if not detected:
+        raise ValueError(f'Cannot detect the cluster release from {image}; use a published HRBC office image.')
+    if requested and requested != 'auto' and requested != detected:
+        raise ValueError(f'Configured release {requested} does not match running cluster {detected}. '
+                         'Update FEATURE_ENV_RELEASE / the extension version setting, or leave it blank for automatic detection.')
+    return detected
+
+
+def validate_original_image(service, image, release):
+    if image.startswith('local/'):
+        raise ValueError(f'{service} uses a local image; start the published cluster before capturing its restore baseline.')
+    if service in (SERVICES['web'], SERVICES['api']) and image_release(image) != release:
+        raise ValueError(f'{service} image {image} does not match cluster {release}; finish the cluster upgrade before Build.')
+
+
+def baseline_release(state):
+    return state.get('release') or image_release(state['originals'].get(SERVICES['web'], ''))
+
+
+def ensure_current_baseline(args, state):
+    """Capture an upgraded published cluster without losing the old restore baseline."""
+    global STATE
+    previous = baseline_release(state)
+    if previous == args.release:
+        return state
+    if args.command != 'build':
+        raise ValueError(f'Saved baseline release {previous or "unknown"} differs from cluster {args.release}. '
+                         'Run Build to refresh the baseline before deploying or restoring.')
+    for service in SERVICES.values():
+        image = inspect(f'{state["project"]}-{service}-1')['Config']['Image']
+        if image.startswith('local/'):
+            raise ValueError(f'Cluster upgraded to {args.release}, but {service} still runs {image}. '
+                             'Start the upgraded cluster with its published application images, then run Build again. '
+                             'The existing restore baseline has been preserved.')
+    original_state_dir = STATE
+    args.source = state['source']
+    # Prepare in isolation: a failed capture leaves every active state file intact.
+    with tempfile.TemporaryDirectory(prefix='feature-env-refresh-', dir=STATE.parent) as temporary:
+        try:
+            STATE = Path(temporary)
+            prepare(args)
+        finally:
+            STATE = original_state_dir
+        replacement = Path(temporary)
+        backup = STATE / ('backup-release-' + uuid.uuid4().hex[:12])
+        backup.mkdir(mode=0o700)
+        names = ('state.json', 'normal.json', 'build.json', 'feature.json', 'routing.json')
+        for name in names:
+            if (STATE / name).exists():
+                shutil.copy2(STATE / name, backup / name)
+        for name in ('state.json', 'normal.json'):
+            (replacement / name).replace(STATE / name)
+        for name in ('build.json', 'feature.json', 'routing.json'):
+            (STATE / name).unlink(missing_ok=True)
+        print(f'Cluster release changed: {previous} -> {args.release}. Previous state: {backup}', flush=True)
+    return json.loads((STATE / 'state.json').read_text())
+
+
+def check_build_release(targets, release):
+    """A partial rebuild must not make old images eligible for deployment."""
+    path = STATE / 'build.json'
+    builds = json.loads(path.read_text()) if path.exists() else {}
+    releases = builds.get('releases', {})
+    stale = [key for key in targets if releases.get(key) != release]
+    if stale:
+        raise ValueError(f'Rebuild {", ".join(stale)} for cluster {release} before deploying; '
+                         'their saved builds have an old or unverified release.')
+
 
 def prepare(args):
     """Capture the existing cluster's restore baseline without replacing containers."""
@@ -151,6 +250,8 @@ def prepare(args):
     if any(not p.is_file() for p in files):
         raise ValueError('Source uses extra Compose files; supply the matching checkout before continuing')
     defaults = compose / 'clusters/hrbc' / args.release / 'docker.env'
+    if not defaults.is_file():
+        raise ValueError(f'Missing release definition {defaults}; update devcontainer-settings for cluster {args.release}.')
     raw = output(['bash', '-c', 'set -a; source "$1"; env -0', 'feature-env', defaults])
     env = os.environ.copy()
     env.update({k.removeprefix('PDOCKERV_'): v for x in raw.split('\0') if '=' in x for k, v in [x.split('=', 1)] if k.startswith('PDOCKERV_')})
@@ -176,6 +277,7 @@ def prepare(args):
         runtime_env = dict(x.split('=', 1) for x in old['Config']['Env'])
         service['environment'] = runtime_env
         if name in SERVICES.values():
+            validate_original_image(name, service['image'], args.release)
             originals[name] = service['image']
         if service.get('container_name') or service.get('network_mode'):
             raise ValueError(f'{name}: fixed container name or network mode requires review')
@@ -192,7 +294,7 @@ def prepare(args):
             value['name'] = args.project + '_' + name
     config['name'] = args.project
     save(STATE / 'normal.json', escape_compose(config))
-    save(STATE / 'state.json', {'project': args.project, 'source': args.source, 'repos': str(Path(args.repos or BUNDLE.parent / 'hrbc').expanduser().resolve()), 'originals': originals, 'daemon': output(['docker', 'info', '--format', '{{.ID}}']).strip()})
+    save(STATE / 'state.json', {'project': args.project, 'source': args.source, 'repos': str(Path(args.repos or BUNDLE.parent / 'hrbc').expanduser().resolve()), 'originals': originals, 'release': args.release, 'daemon': output(['docker', 'info', '--format', '{{.ID}}']).strip()})
     print(f'Prepared image overrides for existing {args.source}; no containers changed.')
 
 def snapshot(repo, destination):
@@ -386,7 +488,8 @@ def build(args, state):
     all_images = {**previous.get('images', {}), **images}
     all_metadata = {**previous.get('repositories', {}), **metadata}
     save(STATE / 'feature.json', {'services': {SERVICES[key]: {'image': image, 'pull_policy': 'never'} for key, image in all_images.items()}})
-    save(STATE / 'build.json', {'repositories': all_metadata, 'images': all_images, 'build_id': build_id})
+    save(STATE / 'build.json', {'repositories': all_metadata, 'images': all_images, 'build_id': build_id,
+                              'releases': {**previous.get('releases', {}), **{key: args.release for key in args.targets}}})
     print(json.dumps({'repositories': metadata, 'images': images}, indent=2))
     elapsed = int(time.monotonic() - overall_started)
     print(f'Build completed in {elapsed}s. Images are built, not deployed.', flush=True)
@@ -559,7 +662,7 @@ def main():
     parser.add_argument('command', choices=['prepare', 'paths', 'build', 'up', 'restore', 'stop', 'status', 'clean'])
     parser.add_argument('--env-file', type=Path, help='Configuration file; defaults to .env beside this script')
     parser.add_argument('--source', default='hrbc1')
-    parser.add_argument('--release', default=None, help='Compose cluster release; defaults to FEATURE_ENV_RELEASE in .env, then 9-3-0')
+    parser.add_argument('--release', default=None, help='Expected cluster release; defaults to FEATURE_ENV_RELEASE, then automatic detection')
     parser.add_argument('--settings-container', help='Existing stopped container mounting devcontainer-settings')
     parser.add_argument('--repos', help='Fallback parent of the four repositories; FEATURE_ENV_*_REPO variables override individual paths')
     parser.add_argument('--add-host', action='append', default=[], help='Optional build-only hostname:IP mapping for VPN/Docker DNS')
@@ -577,7 +680,7 @@ def main():
     load_environment(env_file)
     STATE = Path(os.environ.get('FEATURE_ENV_STATE_DIR', str(BUNDLE / '.feature-env'))).expanduser().resolve()
     if args.release is None:
-        args.release = os.environ.get('FEATURE_ENV_RELEASE', '9-3-0')
+        args.release = os.environ.get('FEATURE_ENV_RELEASE')
     print(f'Configuration: {env_file if env_file.is_file() else "process environment/defaults"}\nState: {STATE}', flush=True)
     if args.command == 'prepare' and (args.only or args.exclude):
         parser.error('prepare captures the whole cluster; selection applies to paths/build/up/restore/stop/status')
@@ -594,6 +697,11 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         raise ValueError('Another feature-env command is running')
+    if args.command in {'prepare', 'build', 'up', 'restore'}:
+        state_path = STATE / 'state.json'
+        project = json.loads(state_path.read_text())['project'] if state_path.exists() else args.source
+        args.release = cluster_release(project, args.release)
+        print(f'Cluster release: {args.release}', flush=True)
     if args.command == 'prepare':
         prepare(args)
         return
@@ -614,9 +722,13 @@ def main():
         raise ValueError('Docker daemon changed since preparation')
     if state['project'] != state['source']:
         raise ValueError('State targets a separate project; prepare existing-cluster state first')
+    heal_stray_renames(state)
+    if args.command in {'build', 'up', 'restore'}:
+        state = ensure_current_baseline(args, state)
     if args.command == 'build':
         build(args, state)
     elif args.command == 'up':
+        check_build_release(args.targets, args.release)
         deploy(state, args.targets)
     elif args.command == 'restore':
         # Reuse the baseline without local image overrides; database contents are untouched.
