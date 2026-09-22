@@ -116,7 +116,7 @@ The dispatch code makes the architecture explicit:
         run(compose(state, False) + ['up', '-d', '--no-deps', '--wait', '--wait-timeout', '180', *[SERVICES[key] for key in args.targets]])
         if 'web' in args.targets:
             refresh_web_routing(state)
-        run(['docker', 'restart', state['project'] + '-hrbcprivateapicore-1', state['project'] + '-hrbcweblb-1'])
+        restart_routing(state, args.targets)
     elif args.command == 'stop':
         run(compose(state, False) + ['stop', *[SERVICES[key] for key in args.targets]])
     else:
@@ -828,7 +828,7 @@ def deploy(state, targets):
     start_dependencies(state, after_apps=True)
     if 'web' in targets:
         refresh_web_routing(state)
-    run(['docker', 'restart', state['project'] + '-hrbcprivateapicore-1', state['project'] + '-hrbcweblb-1'])
+    restart_routing(state, targets)
     summary(state, targets)
 ```
 
@@ -841,7 +841,7 @@ def deploy(state, targets):
 - `up -d` runs services in the background. `--no-deps` prevents Compose from also recreating dependencies; this program handles existing support containers separately.
 - `--wait --wait-timeout 300` waits for the selected services to reach the required running/healthy state. `--pull never` requires the locally available images.
 - Web deployment may update the React asset routing rule.
-- Both shared routing containers, `hrbcprivateapicore` and `hrbcweblb`, are restarted after successful deployment even when a single application was selected.
+- `restart_routing()` restarts `hrbcprivateapicore` only when `api` is selected, and `hrbcweblb` only when `ui`, `proxy`, or `web` is selected. Selecting both groups restarts both routers.
 - The function finishes by printing actual container status. There is no automatic call to `restore()` if deployment or a health check fails.
 
 **Source:** [src/feature-env.py](src/feature-env.py), lines 348–364.
@@ -970,7 +970,7 @@ def summary(state, targets=None):
         run(compose(state, False) + ['up', '-d', '--no-deps', '--wait', '--wait-timeout', '180', *[SERVICES[key] for key in args.targets]])
         if 'web' in args.targets:
             refresh_web_routing(state)
-        run(['docker', 'restart', state['project'] + '-hrbcprivateapicore-1', state['project'] + '-hrbcweblb-1'])
+        restart_routing(state, args.targets)
     elif args.command == 'stop':
         run(compose(state, False) + ['stop', *[SERVICES[key] for key in args.targets]])
     else:
@@ -978,7 +978,7 @@ def summary(state, targets=None):
 ```
 
 - `restore` uses `compose(state, False)`, so local image overrides are absent. Compose runs the selected application services with the saved baseline configuration.
-- Restore repeats the network alias check, waits up to 180 seconds, refreshes web routing when applicable, and restarts the shared routing containers.
+- Restore repeats the network alias check, waits up to 180 seconds, refreshes web routing when applicable, and restarts only the routers affected by the selected applications.
 - This restores application image/configuration choices, not local Git changes or database rows. This branch contains no database restore or volume deletion operation.
 - `stop` stops selected application services without removing their containers or volumes.
 - Restore does not include deploy's explicit `--pull never`; its image availability behavior follows the baseline/Compose settings. Keeping `state.json` and `normal.json` preserves the image references, not an immutable backup of the image bytes.
@@ -1401,10 +1401,10 @@ exec bash "$(dirname "$(readlink -f "$0")")/feature-env.sh" up "$@"
     start_dependencies(state, after_apps=True)
     if 'web' in targets:
         refresh_web_routing(state)
-    run(['docker', 'restart', state['project'] + '-hrbcprivateapicore-1', state['project'] + '-hrbcweblb-1'])
+    restart_routing(state, targets)
 ```
 
-`compose(state)` supplies both `normal.json` and `feature.json`. The selected UI gets the new image with its saved environment/network configuration. Existing support containers may be started, and the two shared routing containers are restarted after success. The web-specific routing refresh is skipped because `web` was not selected.
+`compose(state)` supplies both `normal.json` and `feature.json`. The selected UI gets the new image with its saved environment/network configuration. Existing support containers may be started, and only `hrbcweblb` is restarted after success. The web-specific routing refresh is skipped because `web` was not selected.
 
 **Step 3 — Docker evaluates the image's health check while Compose waits.**
 
@@ -1461,7 +1461,7 @@ exec bash "$(dirname "$(readlink -f "$0")")/feature-env.sh" restore "$@"
         run(compose(state, False) + ['up', '-d', '--no-deps', '--wait', '--wait-timeout', '180', *[SERVICES[key] for key in args.targets]])
         if 'web' in args.targets:
             refresh_web_routing(state)
-        run(['docker', 'restart', state['project'] + '-hrbcprivateapicore-1', state['project'] + '-hrbcweblb-1'])
+        restart_routing(state, args.targets)
 ```
 
 The selected service is resolved exactly as during deployment. Network alias conflicts still block the change.
@@ -1483,7 +1483,7 @@ Because restore passes `False`, `feature.json` is not appended. Compose receives
 
 **Step 3 — Compose applies the baseline and routing containers restart.**
 
-The restore branch's `up` command waits for the selected service, then restarts the shared routing containers. A web restore additionally recalculates the route from the restored PHP version. Local source files, built images, and saved build metadata remain available; no database rollback is performed.
+The restore branch's `up` command waits for the selected service, then restarts only the routers affected by the selected applications. A web restore additionally recalculates the route from the restored PHP version. Local source files, built images, and saved build metadata remain available; no database rollback is performed.
 
 ### Reading outcomes correctly
 
@@ -1492,7 +1492,7 @@ The restore branch's `up` command waits for the selected service, then restarts 
 | “I built successfully, but the browser still shows the old app.” | `build()` only saves image choices; `deploy()` is a separate command. |
 | “My edited client code appears in the UI build.” | `repository_paths()` adds `client`, and `ui.Dockerfile` substitutes its package before compiling UI. |
 | “A file edit after building did not appear.” | `snapshot()` copied the files before Docker built the image; there is no live source mount in these recipes. |
-| “Only UI was selected, but routing containers restarted.” | `deploy()` and the restore branch explicitly restart both shared routing containers. |
+| “Only UI was selected, and the web router restarted.” | UI replacement can change its IP, so `hrbcweblb` restarts; `hrbcprivateapicore` does not. |
 | “A failed build did not change the next deployment image.” | `feature.json` is updated after all selected Docker builds succeed. |
 | “Restoring the image did not restore my database.” | The restore branch runs Compose with saved application configuration; it performs no database restore. |
 | “Status shows an image but no branch metadata.” | `summary()` prints provenance only when the actual image matches the recorded local build. |

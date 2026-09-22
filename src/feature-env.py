@@ -112,6 +112,33 @@ def heal_stray_renames(state):
             print(f'Repairing interrupted container swap: {current} -> {expected}', flush=True)
             run(['docker', 'rename', current, expected])
 
+def container_source(value):
+    """Parse an explicit container checkout without guessing a container or volume."""
+    match = re.fullmatch(r'docker://([a-zA-Z0-9][a-zA-Z0-9_.-]*)(/[^\x00\r\n]*)', value)
+    if not match or '..' in Path(match[2]).parts or match[2] == '/':
+        raise ValueError('Container source must be docker://<container-name-or-id>/<absolute-repo-path> (no ..)')
+    return match[1], match[2].rstrip('/')
+
+
+def volume_source(value):
+    """Paths are relative to the volume root, not the Dev Container workspace."""
+    match = re.fullmatch(r'volume://([a-zA-Z0-9][a-zA-Z0-9_.-]+)(/[^\x00\r\n]*)?', value)
+    if not match or '..' in Path(match[2] or '/').parts:
+        raise ValueError('Volume source must be volume://<volume-name>[/repo-subdirectory] (no ..)')
+    return match[1], (match[2] or '').rstrip('/')
+
+
+def validate_repository(repo, label):
+    if not repo.is_dir():
+        raise ValueError(f'{label}: repository directory does not exist: {repo}')
+    try:
+        top = Path(output(['git', '-C', repo, 'rev-parse', '--show-toplevel'], stderr=subprocess.PIPE).strip()).resolve()
+    except subprocess.CalledProcessError:
+        raise ValueError(f'{label}: not a Git working tree: {repo}') from None
+    if top != repo.resolve():
+        raise ValueError(f'{label}: use the repository root {top}, not {repo}')
+
+
 def repository_paths(state, targets, parent=None):
     """Resolve selected Git roots, including the local client whenever UI is selected."""
     base = Path(parent or state.get('repos', str(BUNDLE.parent / 'hrbc'))).expanduser().resolve()
@@ -126,15 +153,14 @@ def repository_paths(state, targets, parent=None):
         configured = os.environ.get(variable)
         if configured is not None and not configured.strip():
             raise ValueError(f'{variable} is empty; enter its repository root in your .env file')
+        if configured is not None and configured.startswith(('docker://', 'volume://')):
+            if key not in {'ui', 'proxy'}:
+                raise ValueError(f'{variable}: container and volume sources are supported only for ui and openapi-proxy')
+            (volume_source if configured.startswith('volume://') else container_source)(configured)
+            paths[key] = configured
+            continue
         repo = Path(configured).expanduser().resolve() if configured is not None else base / name
-        if not repo.is_dir():
-            raise ValueError(f'{variable}: repository directory does not exist: {repo}')
-        try:
-            top = Path(output(['git', '-C', repo, 'rev-parse', '--show-toplevel'], stderr=subprocess.PIPE).strip()).resolve()
-        except subprocess.CalledProcessError:
-            raise ValueError(f'{variable}: not a Git working tree: {repo}') from None
-        if top != repo.resolve():
-            raise ValueError(f'{variable}: use the repository root {top}, not {repo}')
+        validate_repository(repo, variable)
         paths[key] = repo
     return paths
 
@@ -297,13 +323,55 @@ def prepare(args):
     save(STATE / 'state.json', {'project': args.project, 'source': args.source, 'repos': str(Path(args.repos or BUNDLE.parent / 'hrbc').expanduser().resolve()), 'originals': originals, 'release': args.release, 'daemon': output(['docker', 'info', '--format', '{{.ID}}']).strip()})
     print(f'Prepared image overrides for existing {args.source}; no containers changed.')
 
-def snapshot(repo, destination):
+def snapshot(repo, destination, volume_image=None):
     """Copy saved working-tree source while excluding credentials and generated output."""
+    if isinstance(repo, str) and repo.startswith('volume://'):
+        volume, subdirectory = volume_source(repo)
+        try:
+            run(['docker', 'volume', 'inspect', volume], stdout=subprocess.DEVNULL)
+        except subprocess.CalledProcessError:
+            raise ValueError(f'Volume {volume} does not exist on the current Docker daemon; '
+                             'check docker volume ls. No volume was created.') from None
+        if not volume_image:
+            raise ValueError('A local runtime image is required for the volume snapshot helper')
+        # Reuse the selected cluster runtime image, without pulling or executing it.
+        # nocopy prevents Docker populating an empty source volume from that image.
+        helper = output(['docker', 'create', '--pull', 'never', '--network', 'none', '--read-only',
+                         '--mount', f'type=volume,source={volume},target=/image-linker-source,readonly,volume-nocopy',
+                         '--entrypoint', '/bin/true', volume_image]).strip()
+        try:
+            metadata = snapshot(f'docker://{helper}/image-linker-source{subdirectory}', destination)
+            metadata['repository'] = repo
+            return metadata
+        finally:
+            # -v removes only anonymous helper volumes, never the named source volume.
+            run(['docker', 'rm', '-v', helper], stdout=subprocess.DEVNULL)
+    if isinstance(repo, str) and repo.startswith('docker://'):
+        container, source = container_source(repo)
+        # docker cp also reads stopped containers. Keep the complete checkout outside
+        # the Docker build context and remove it even when validation/copying fails.
+        with tempfile.TemporaryDirectory(prefix='image-linker-source-') as temporary:
+            checkout = Path(temporary) / 'repo'
+            checkout.mkdir()
+            try:
+                run(['docker', 'cp', f'{container}:{source}/.', checkout])
+            except subprocess.CalledProcessError:
+                raise ValueError(f'Cannot copy {repo}; check the container name and repository path. '
+                                 'The container must still exist, but may be stopped.') from None
+            if not (checkout / '.git').is_dir() or (checkout / '.git').is_symlink():
+                raise ValueError(f'{repo}: expected a standalone Git checkout with a .git directory; '
+                                 'linked worktrees are not supported for container sources')
+            validate_repository(checkout, repo)
+            metadata = snapshot(checkout, destination)
+            metadata['repository'] = repo
+            return metadata
     destination.mkdir(parents=True)
     # Current working files, including non-ignored untracked feature source. No .git/config or credentials.
     paths = output(['git', '-C', repo, 'ls-files', '-z', '--cached', '--others', '--exclude-standard']).split('\0')
     for name in set(paths) - {''}:
         p = Path(name)
+        if p.is_absolute() or '..' in p.parts:
+            raise ValueError(f'Unsafe build source path: {name}')
         if any(part in {'.git', '.devcontainer', '.vscode', 'node_modules', '.gradle'} for part in p.parts):
             continue
         static_source = p.parts[:2] in {
@@ -314,10 +382,10 @@ def snapshot(repo, destination):
         if p.name in {'.npmrc', '.env', 'auth.pubkey.pem'} or p.suffix in {'.pem', '.key'} or p.name.startswith('.env.') or p.name.endswith('.local.env'):
             continue
         src = repo / p
+        if any((repo / Path(*p.parts[:i])).is_symlink() for i in range(1, len(p.parts) + 1)):
+            raise ValueError(f'Symlink in build source requires review: {src}')
         if not src.exists():
             continue
-        if src.is_symlink():
-            raise ValueError(f'Symlink in build source requires review: {src}')
         if src.is_file():
             target = destination / p
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -400,7 +468,8 @@ def build(args, state):
         source_keys.add('client')
     for position, (key, repo) in enumerate(repos.items(), 1):
         print(f'[{position}/{len(repos)}] Snapshot {key}: {repo}', flush=True)
-        metadata[key] = snapshot(repo, context / key)
+        metadata[key] = snapshot(repo, context / key, volume_image=state['originals'][SERVICES[key]]
+                                 if key in {'ui', 'proxy'} else None)
         meta = metadata[key]
         print(f'[{key}] Snapshot ready | {meta["branch"]} | {meta["sha"][:12]} | dirty={meta["dirty"]}', flush=True)
     if 'web' in source_keys:
@@ -571,6 +640,17 @@ def start_dependencies(state, after_apps=False):
             run(['docker', 'start', container])
 
 
+def restart_routing(state, targets):
+    """Refresh only routers whose application backends may have changed address."""
+    routers = []
+    if 'api' in targets:
+        routers.append('hrbcprivateapicore')
+    if set(targets).intersection({'ui', 'proxy', 'web'}):
+        routers.append('hrbcweblb')
+    if routers:
+        run(['docker', 'restart', *[state['project'] + '-' + router + '-1' for router in routers]])
+
+
 def refresh_web_routing(state):
     """Align the standard React route with deployed PHP's asset version when needed."""
     version = output(['docker', 'exec', state['project'] + '-hrbcproductweb-1',
@@ -650,7 +730,7 @@ def deploy(state, targets):
     start_dependencies(state, after_apps=True)
     if 'web' in targets:
         refresh_web_routing(state)
-    run(['docker', 'restart', state['project'] + '-hrbcprivateapicore-1', state['project'] + '-hrbcweblb-1'])
+    restart_routing(state, targets)
     summary(state, targets)
 
 
@@ -736,7 +816,7 @@ def main():
         run(compose(state, False) + ['up', '-d', '--no-deps', '--wait', '--wait-timeout', '180', *[SERVICES[key] for key in args.targets]])
         if 'web' in args.targets:
             refresh_web_routing(state)
-        run(['docker', 'restart', state['project'] + '-hrbcprivateapicore-1', state['project'] + '-hrbcweblb-1'])
+        restart_routing(state, args.targets)
     elif args.command == 'stop':
         run(compose(state, False) + ['stop', *[SERVICES[key] for key in args.targets]])
     elif args.command == 'clean':

@@ -34,59 +34,67 @@ sudo apt-get update && sudo apt-get install -y git python3
 
 No `pip install` is needed — the script only uses Python's standard library.
 
-### `ui` and `api-client-privateapi` must bind-mount, not clone into a volume
+### UI and openapi-proxy sources: local checkout, Docker volume or container
 
-This tool builds from your host/WSL path in `FEATURE_ENV_*_REPO`, never from
-inside a Dev Container. `api-client-privateapi`'s Dev Container already binds
-your local folder. `ui`'s and `openapi-proxy`'s may still clone into an
-internal Docker volume instead — in that case, your edits stay in the volume
-and never reach the host path, so this tool builds stale code.
+For a repo stored at the root of the `hrbc-ui` named volume, configure:
 
-The fix for both repos is the same: point `workspaceMount` at your local
-checkout with a `bind` mount instead of letting the container clone its own
-copy into a `volume`. A bind mount means the container's `/workspaces/...`
-folder *is* your host folder (edits go straight to disk, visible to this
-tool); a volume is a separate, container-managed copy that a `git clone`
-step populates once and your host-side edits never reach.
-
-Fix `ui/.devcontainer/devcontainer.json`:
-
-```jsonc
-// Before (wrong — clones into a volume):
-"workspaceMount": "source=hrbc-ui,target=/workspaces/hrbc-ui-react,type=volume",
-
-// After (correct — binds your local folder):
-"workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/hrbc-ui-react,type=bind,consistency=cached",
+```dotenv
+FEATURE_ENV_UI_REPO="volume://hrbc-ui"
 ```
 
-Fix `openapi-proxy/.devcontainer/devcontainer.json` the same way:
+Or set `localImageLinker.repos.ui` to `volume://hrbc-ui` in the extension.
+If proxy also uses a named volume, use `volume://privateapi-web-proxy` for
+`FEATURE_ENV_PROXY_REPO` / `localImageLinker.repos.openapiProxy`.
+With `type=bind`, use the host checkout path instead.
+Find actual volume names with `docker volume ls`.
 
-```jsonc
-// Before (wrong — clones into a volume):
-"workspaceMount": "source=privateapi-web-proxy,target=/workspaces/privateapi-web-proxy,type=volume",
+The path after the volume name is relative to the **volume root**, not the
+Dev Container's mount destination. For your UI workspace mount, the checkout
+is at the volume root: use `volume://hrbc-ui`, without `/workspaces/hrbc-ui-react`.
+If a volume contains multiple folders, use e.g. `volume://my-volume/ui`.
 
-// After (correct — binds your local folder):
-"workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/privateapi-web-proxy,type=bind",
+Build checks the volume exists, creates a temporary helper using the selected
+service's saved cluster runtime image (which must be available locally), and mounts
+the volume read-only with `volume-nocopy`. The helper is never started and has no
+network access. After copying the checkout, the helper is removed; the source
+volume remains untouched. This works even after the original Dev Container has
+been removed. Missing volumes fail rather than being intentionally created.
+No helper image is downloaded.
+
+No Dev Container configuration changes are required. Each repo setting accepts
+an absolute host/WSL checkout path or `docker://<container-name-or-id>/<repo-path>`.
+Container sources work with both named volumes and bind mounts.
+
+For example, in `src/.env` (replace container names with your own):
+
+```dotenv
+FEATURE_ENV_UI_REPO="docker://my-ui-devcontainer/workspaces/hrbc-ui-react"
+FEATURE_ENV_PROXY_REPO="docker://my-proxy-devcontainer/workspaces/privateapi-web-proxy"
 ```
 
-Then, for each repo, delete any `git clone`/`[ -d /workspace... ]` line that
-re-clones that same repo inside `.devcontainer/post-create.sh` (a bind mount
-already has the checkout; re-cloning would overwrite your local edits with a
-fresh clone), and rebuild + reopen the Dev Container (Command Palette →
-**Dev Containers: Rebuild and Reopen in Container**) so the new
-`workspaceMount` takes effect — VS Code only reads `workspaceMount` when the
-container is (re)created, not on a simple reload.
+In VS Code extension settings, use the same values for
+`localImageLinker.repos.ui` and `localImageLinker.repos.openapiProxy`.
+Find container names with `docker ps -a --format '{{.Names}}'`.
+You can mix sources: UI in a named volume and proxy at a local host path works too.
+Use the container containing the checkout you actually edit, not the cluster's
+application container. Docker must be connected to that container's daemon.
 
-`api-client-privateapi/.devcontainer/devcontainer.json` should already look
-like this (uses `src=`/`dst=` instead of `source=`/`target=`, same idea):
+Build copies the checkout from the running or stopped container into a private
+temporary directory, then snapshots tracked and non-ignored untracked files.
+Saved uncommitted edits and deletions are reflected; unsaved editor buffers are not.
+Avoid editing during the copy if you need a consistent snapshot.
+The same exclusions apply as for local builds: Git metadata, credentials,
+dependencies and generated output are excluded from the build context.
+The temporary copy is removed on completion or failure. The initial copy includes
+the entire checkout (including dependencies), so large checkouts need extra disk
+space and can take longer. Nothing is copied back into your repo or container.
 
-```jsonc
-// Before (wrong — clones into a volume):
-"workspaceMount": "src=api-client-private,dst=/workspaces/api-client-private,type=volume",
-
-// After (correct — binds your local folder):
-"workspaceMount": "src=${localWorkspaceFolder},dst=/workspaces/api-client-private,type=bind,consistency=cached",
-```
+The container must still exist; removed containers cannot be read using `docker://`. Use `volume://` to read
+a surviving named volume directly. Container and volume sources require a standalone checkout with its own `.git`
+directory; linked Git worktrees are not supported. `paths` checks the source
+syntax; Build checks that the container and checkout are accessible.
+`api-client-privateapi` remains a required local checkout for UI builds, and
+`hrbc` continues to use a local checkout.
 
 ## 2. One-Time Setup
 
@@ -143,6 +151,10 @@ Most tasks prompt with a dropdown for an optional target (`ui`, `proxy`, `api`,
    is no watch mode; each run is a fresh snapshot and a fresh `docker build`.
 6. When finished, run task **Local Image Linker: Restore** with the same target to put
    the original image back.
+
+Deploy and Restore restart only the routers affected by the selected applications:
+`api` restarts `hrbcprivateapicore`; `ui`, `proxy`, or `web` restarts `hrbcweblb`.
+Selecting both groups restarts both routers.
 
 ### What you'll see during a build
 
