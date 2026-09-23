@@ -33,6 +33,13 @@
             "problemMatcher": []
         },
         {
+            "label": "Local Image Linker: Sync Web (live)",
+            "type": "shell",
+            "command": "bash \"${workspaceFolder}/src/run/feature-env.sh\" sync --only web",
+            "isBackground": true,
+            "problemMatcher": []
+        },
+        {
             "label": "Local Image Linker: Status",
             "type": "shell",
             "command": "bash \"${workspaceFolder}/src/run/feature-env.sh\" status ${ONLY:+--only $ONLY}",
