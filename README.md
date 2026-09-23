@@ -223,7 +223,7 @@ bash run/restore.sh --exclude ui
 | `bash run/restore.sh [--only/--exclude ...]` | Put selected services back on their original saved images. Database data is untouched. |
 | `bash run/feature-env.sh status [--only/--exclude ...]` | Show each selected service's container health and which image/commit it's running. |
 | `bash run/feature-env.sh stop [--only/--exclude ...]` | Stop selected containers without changing their configured image. |
-| `bash run/clean.sh [--dry-run] [--only/--exclude ...] [--keep-builds N]` | Remove unused local images and old build snapshots. |
+| `bash run/clean.sh [--dry-run] [--only/--exclude ...] [--keep-builds N]` | Remove unused local images of the selected targets, and build snapshots older than the newest N (default 2, across all targets; `0` keeps all). |
 | `bash run/feature-env.sh paths [--only/--exclude ...]` | Print the repository path resolved for each target, without touching Docker. |
 
 ### Useful options

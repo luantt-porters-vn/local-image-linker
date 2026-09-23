@@ -754,7 +754,9 @@ def main():
     parser.add_argument('--npmrc', help='Private npm config mounted as a BuildKit secret')
     parser.add_argument('--jobs', type=int, choices=range(1, 5), default=2)
     parser.add_argument('--dry-run', action='store_true', help='clean: list what would be removed without removing it')
-    parser.add_argument('--keep-builds', type=int, default=2, help='clean: most recent build snapshots to retain per target selection')
+    parser.add_argument('--keep-builds', type=int, default=2,
+                        help='clean: most recent build snapshots to retain across all targets (0 keeps all); '
+                             'the latest build is always kept and --only/--exclude do not apply')
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument('--only', nargs='+', choices=TARGETS, help='Build/manage only these repositories or runtime targets')
     selection.add_argument('--exclude', nargs='+', choices=TARGETS, help='Leave these repositories or runtime targets to Dev Containers')
