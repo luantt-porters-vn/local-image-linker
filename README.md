@@ -4,9 +4,10 @@ Build your local HRBC source (`ui`, `openapi-proxy`, `hrbc`, `api-client-private
 into Docker images and swap them into an **already-running** HRBC cluster, so you can
 test multi-repo changes together without leaving Dev Containers running.
 
-This tool does not create a cluster and does not give you live reload — it does a real
-`docker build` from a snapshot of your working tree each time you ask it to. It
-complements the Dev Container workflow; it does not replace it for day-to-day coding.
+This tool does not create a cluster. Each Build does a real `docker build` from a
+snapshot of your working tree; only PHP under `hrbc/product` can additionally be
+synced live (see [Live PHP sync](#live-php-sync-web-only)). It complements the Dev
+Container workflow; it does not replace it for day-to-day coding.
 
 ## 1. Requirements
 
@@ -131,6 +132,7 @@ Most tasks prompt with a dropdown for an optional target (`ui`, `proxy`, `api`,
 | **Local Image Linker: Deploy** | Swaps the selected running containers to the last built local images and waits for their health checks. |
 | **Local Image Linker: Restore** | Puts the selected services back on their original saved images. Database data is untouched. |
 | **Local Image Linker: Status** | Shows each selected service's container health and which image/commit it's currently running. |
+| **Local Image Linker: Sync Web (live)** | After deploying `web`, copies saved changes under `hrbc/product` into the running container every second until stopped. |
 | **Local Image Linker: Stop** | Stops the selected containers without changing their configured image. |
 | **Local Image Linker: Clean Images (Preview)** | Lists unused local images and stale build snapshots without removing anything. |
 | **Local Image Linker: Clean Images (Remove)** | Actually removes those unused local images and stale build snapshots. |
@@ -147,14 +149,30 @@ Most tasks prompt with a dropdown for an optional target (`ui`, `proxy`, `api`,
    does not replace any container by itself.
 4. Run task **Local Image Linker: Deploy** with the same target to swap it into the
    cluster, then test as normal.
-5. Repeat steps 1, 3, 4 every time you want your latest changes reflected — there
-   is no watch mode; each run is a fresh snapshot and a fresh `docker build`.
+5. Repeat steps 1, 3, 4 every time you want your latest changes reflected — each run
+   is a fresh snapshot and a fresh `docker build`. For PHP-only edits, see below.
 6. When finished, run task **Local Image Linker: Restore** with the same target to put
    the original image back.
 
 Deploy and Restore restart only the routers affected by the selected applications:
 `api` restarts `hrbcprivateapicore`; `ui`, `proxy`, or `web` restarts `hrbcweblb`.
 Selecting both groups restarts both routers.
+
+### Live PHP sync (web only)
+
+After **Deploy** of `web`, run task **Local Image Linker: Sync Web (live)** (or
+`bash run/feature-env.sh sync --only web [--interval SECONDS]`). It first copies
+anything saved under `hrbc/product` since that build, then keeps copying saved
+changes and deletions into the running `hrbcproductweb` container. PHP runs without
+opcache, so the next request uses the new code; no restart or rebuild is needed.
+
+- Uses the same file selection as Build (tracked and non-ignored files, no credentials).
+- `static_source` changes are not synced; they need Build & Deploy (Ant build).
+- Status still shows the built image; synced edits live only in that container.
+  The next Deploy or Restore recreates it and discards them.
+- Sync holds the command lock: stop it (Ctrl+C) before Build/Deploy/Restore.
+- It refuses to start unless `web` runs the image this tool deployed and that
+  build's snapshot still exists (Clean may remove it; then Build & Deploy again).
 
 ### What you'll see during a build
 
@@ -225,6 +243,7 @@ bash run/restore.sh --exclude ui
 | `bash run/feature-env.sh stop [--only/--exclude ...]` | Stop selected containers without changing their configured image. |
 | `bash run/clean.sh [--dry-run] [--only/--exclude ...] [--keep-builds N]` | Remove unused local images and old build snapshots. |
 | `bash run/feature-env.sh paths [--only/--exclude ...]` | Print the repository path resolved for each target, without touching Docker. |
+| `bash run/feature-env.sh sync --only web [--interval S]` | Copy saved `hrbc/product` changes into the deployed web container until Ctrl+C. |
 
 ### Useful options
 

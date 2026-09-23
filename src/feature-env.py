@@ -9,6 +9,7 @@ import concurrent.futures
 import fcntl
 import threading
 import time
+import io
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ import sys
 import uuid
 import shlex
 import tempfile
+import tarfile
 
 BUNDLE = Path(__file__).resolve().parent
 STATE = BUNDLE / '.feature-env'
@@ -323,6 +325,34 @@ def prepare(args):
     save(STATE / 'state.json', {'project': args.project, 'source': args.source, 'repos': str(Path(args.repos or BUNDLE.parent / 'hrbc').expanduser().resolve()), 'originals': originals, 'release': args.release, 'daemon': output(['docker', 'info', '--format', '{{.ID}}']).strip()})
     print(f'Prepared image overrides for existing {args.source}; no containers changed.')
 
+def source_files(repo, *pathspec):
+    """Saved working-tree files that belong in a build, relative to repo.
+
+    Tracked and non-ignored untracked files, without Git metadata, credentials or generated output.
+    """
+    names = output(['git', '-C', repo, 'ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', *pathspec]).split('\0')
+    files = []
+    for name in sorted(set(names) - {''}):
+        p = Path(name)
+        if p.is_absolute() or '..' in p.parts:
+            raise ValueError(f'Unsafe build source path: {name}')
+        if any(part in {'.git', '.devcontainer', '.vscode', 'node_modules', '.gradle'} for part in p.parts):
+            continue
+        static_source = p.parts[:2] in {
+            ('static_source', directory) for directory in ('js', 'lib', 'themes', 'pages', 'extensions', 'common')
+        }
+        if any(part in {'build', 'dist'} for part in p.parts) and not static_source:
+            continue
+        if p.name in {'.npmrc', '.env', 'auth.pubkey.pem'} or p.suffix in {'.pem', '.key'} or p.name.startswith('.env.') or p.name.endswith('.local.env'):
+            continue
+        src = repo / p
+        if any((repo / Path(*p.parts[:i])).is_symlink() for i in range(1, len(p.parts) + 1)):
+            raise ValueError(f'Symlink in build source requires review: {src}')
+        if src.is_file():
+            files.append(p)
+    return files
+
+
 def snapshot(repo, destination, volume_image=None):
     """Copy saved working-tree source while excluding credentials and generated output."""
     if isinstance(repo, str) and repo.startswith('volume://'):
@@ -366,30 +396,10 @@ def snapshot(repo, destination, volume_image=None):
             metadata['repository'] = repo
             return metadata
     destination.mkdir(parents=True)
-    # Current working files, including non-ignored untracked feature source. No .git/config or credentials.
-    paths = output(['git', '-C', repo, 'ls-files', '-z', '--cached', '--others', '--exclude-standard']).split('\0')
-    for name in set(paths) - {''}:
-        p = Path(name)
-        if p.is_absolute() or '..' in p.parts:
-            raise ValueError(f'Unsafe build source path: {name}')
-        if any(part in {'.git', '.devcontainer', '.vscode', 'node_modules', '.gradle'} for part in p.parts):
-            continue
-        static_source = p.parts[:2] in {
-            ('static_source', directory) for directory in ('js', 'lib', 'themes', 'pages', 'extensions', 'common')
-        }
-        if any(part in {'build', 'dist'} for part in p.parts) and not static_source:
-            continue
-        if p.name in {'.npmrc', '.env', 'auth.pubkey.pem'} or p.suffix in {'.pem', '.key'} or p.name.startswith('.env.') or p.name.endswith('.local.env'):
-            continue
-        src = repo / p
-        if any((repo / Path(*p.parts[:i])).is_symlink() for i in range(1, len(p.parts) + 1)):
-            raise ValueError(f'Symlink in build source requires review: {src}')
-        if not src.exists():
-            continue
-        if src.is_file():
-            target = destination / p
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, target)
+    for p in source_files(repo):
+        target = destination / p
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(repo / p, target)
     # The process umask restricts directories to 0700; runtime images need them traversable by their non-root user.
     for d in [destination, *destination.rglob('*')]:
         if d.is_dir():
@@ -671,6 +681,81 @@ def refresh_web_routing(state):
                                 '--wait', '--wait-timeout', '180', '--pull', 'never', 'hrbcweblb'])
 
 
+WEB_ROOT = '/var/www/hrbc'  # web.Dockerfile: COPY web/product/ /var/www/hrbc/
+
+
+def web_sync_target(state):
+    """Return the web container ID and its build snapshot, only while it runs the image deployed by this tool."""
+    container = inspect(state['project'] + '-hrbcproductweb-1')
+    feature_path = STATE / 'feature.json'
+    deployed = json.loads(feature_path.read_text())['services'].get('hrbcproductweb', {}).get('image') if feature_path.exists() else None
+    image = container['Config']['Image']
+    if not container['State']['Running'] or not image.startswith('local/') or image != deployed:
+        raise ValueError('sync needs web running its locally built image; run Build & Deploy for web first')
+    # Image tags end in the build ID (see build()); that snapshot is what the container started from.
+    baseline = STATE / 'builds' / image.rsplit('-', 1)[1] / 'web' / 'product'
+    if not baseline.is_dir():
+        raise ValueError(f'Build snapshot {baseline} no longer exists (removed by Clean?); run Build & Deploy for web again')
+    return container['Id'], baseline
+
+
+def file_signatures(root, files):
+    """Detect edits by mtime and size, which snapshot() preserves when copying."""
+    return {p: (stat.st_mtime_ns, stat.st_size) for p in files for stat in [(root / p).stat()]}
+
+
+def push_web_changes(container, repo, changed, deleted):
+    """Copy changed product/ files into the running container and remove deleted ones."""
+    if changed:
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode='w') as archive:
+            for p in changed:
+                info = archive.gettarinfo(repo / p, arcname=p.relative_to('product').as_posix())
+                # Match the image: files COPY'd as root, readable by the Apache user.
+                info.uid = info.gid = 0
+                info.uname = info.gname = 'root'
+                info.mode = 0o755 if info.mode & 0o111 else 0o644
+                with (repo / p).open('rb') as source:
+                    archive.addfile(info, source)
+        run(['docker', 'cp', '-', f'{container}:{WEB_ROOT}'], input=buffer.getvalue())
+    if deleted:
+        run(['docker', 'exec', container, 'rm', '-f', '--',
+             *[f'{WEB_ROOT}/{p.relative_to("product").as_posix()}' for p in deleted]])
+
+
+def sync_web(state, repo, interval):
+    """Mirror saved product/ edits into the deployed web container until interrupted.
+
+    PHP runs without opcache, so synced files take effect on the next request. The container
+    still reports its built image; Deploy or Restore recreates it and discards synced files.
+    """
+    container, baseline = web_sync_target(state)
+    previous = file_signatures(baseline.parent, [p.relative_to(baseline.parent) for p in baseline.rglob('*') if p.is_file()])
+    print(f'Syncing {repo / "product"} -> web:{WEB_ROOT} every {interval:g}s; press Ctrl+C to stop.\n'
+          'static_source changes still need Build & Deploy. Deploy/Restore discard synced files.', flush=True)
+    try:
+        while True:
+            current = file_signatures(repo, source_files(repo, 'product'))
+            changed = [p for p, signature in current.items() if previous.get(p) != signature]
+            deleted = [p for p in previous if p not in current]
+            if changed or deleted:
+                try:
+                    current_id = output(['docker', 'inspect', '--format', '{{.Id}}', state['project'] + '-hrbcproductweb-1'],
+                                        stderr=subprocess.DEVNULL).strip()
+                except subprocess.CalledProcessError:
+                    current_id = None
+                if current_id != container:
+                    raise ValueError('web container was removed or recreated; sync stopped')
+                push_web_changes(container, repo, changed, deleted)
+                names = [p.relative_to('product').as_posix() for p in changed[:3]]
+                more = f' (+{len(changed) - 3} more)' if len(changed) > 3 else ''
+                print(f'{time.strftime("%H:%M:%S")} synced {len(changed)}, removed {len(deleted)}: {", ".join(names)}{more}', flush=True)
+            previous = current
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print('Sync stopped. Synced files stay in the container until the next Deploy or Restore.')
+
+
 def clean(state, targets, keep_builds, dry_run):
     """Remove local feature images and stale build snapshots no longer referenced by saved state."""
     build_info = json.loads((STATE / 'build.json').read_text()) if (STATE / 'build.json').exists() else {'images': {}, 'build_id': None}
@@ -739,7 +824,7 @@ def main():
     global STATE
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['prepare', 'paths', 'build', 'up', 'restore', 'stop', 'status', 'clean'])
+    parser.add_argument('command', choices=['prepare', 'paths', 'build', 'up', 'restore', 'stop', 'status', 'clean', 'sync'])
     parser.add_argument('--env-file', type=Path, help='Configuration file; defaults to .env beside this script')
     parser.add_argument('--source', default='hrbc1')
     parser.add_argument('--release', default=None, help='Expected cluster release; defaults to FEATURE_ENV_RELEASE, then automatic detection')
@@ -750,6 +835,7 @@ def main():
     parser.add_argument('--jobs', type=int, choices=range(1, 5), default=2)
     parser.add_argument('--dry-run', action='store_true', help='clean: list what would be removed without removing it')
     parser.add_argument('--keep-builds', type=int, default=2, help='clean: most recent build snapshots to retain per target selection')
+    parser.add_argument('--interval', type=float, default=1.0, help='sync: seconds between checks for saved changes')
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument('--only', nargs='+', choices=TARGETS, help='Build/manage only these repositories or runtime targets')
     selection.add_argument('--exclude', nargs='+', choices=TARGETS, help='Leave these repositories or runtime targets to Dev Containers')
@@ -765,6 +851,8 @@ def main():
     if args.command == 'prepare' and (args.only or args.exclude):
         parser.error('prepare captures the whole cluster; selection applies to paths/build/up/restore/stop/status')
     args.targets = select_targets(args.only, args.exclude)
+    if args.command == 'sync' and args.targets != ['web']:
+        parser.error('sync supports only the PHP web application: use --only web')
     if args.command == 'paths':
         state = json.loads((STATE / 'state.json').read_text()) if (STATE / 'state.json').exists() else {}
         paths = repository_paths(state, args.targets, args.repos)
@@ -821,6 +909,8 @@ def main():
         run(compose(state, False) + ['stop', *[SERVICES[key] for key in args.targets]])
     elif args.command == 'clean':
         clean(state, args.targets, args.keep_builds, args.dry_run)
+    elif args.command == 'sync':
+        sync_web(state, repository_paths(state, ['web'], args.repos)['web'], args.interval)
     else:
         summary(state, args.targets)
 
