@@ -59,6 +59,16 @@ class ContainerSourceTests(unittest.TestCase):
         self.assertEqual(actual['repository'], 'docker://ui-dev/workspaces/hrbc-ui-react')
         self.assertFalse(self.copied_to.exists())
 
+    def test_nested_build_and_dist_source_is_kept_but_root_output_is_not(self):
+        for name in ['src/build/Tool.java', 'lib/dist/index.js', 'build/output.js']:
+            path = self.repo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(name)
+        feature.snapshot(self.repo, self.root / 'out')
+        copied = {str(p.relative_to(self.root / 'out').as_posix()) for p in (self.root / 'out').rglob('*') if p.is_file()}
+        self.assertLessEqual({'src/build/Tool.java', 'lib/dist/index.js'}, copied)
+        self.assertFalse({'build/output.js', 'dist/app.js'} & copied)
+
     def test_mixed_sources_resolve_without_docker(self):
         with patch.dict(os.environ, {'FEATURE_ENV_UI_REPO': 'docker://ui-dev/workspaces/hrbc-ui-react',
                                      'FEATURE_ENV_PROXY_REPO': str(self.repo),

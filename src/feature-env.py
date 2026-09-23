@@ -75,9 +75,17 @@ def output(args, **kw):
     return run(args, stdout=subprocess.PIPE, **kw).stdout.decode()
 
 def save(path, data):
-    """Write private JSON state readable and writable only by its owner."""
-    path.write_text(json.dumps(data, indent=2) + '\n')
-    path.chmod(0o600)
+    """Atomically write private JSON state readable and writable only by its owner."""
+    temporary = path.with_name(f'.{path.name}.{uuid.uuid4().hex[:8]}.tmp')
+    try:
+        with open(temporary, 'x') as handle:
+            os.chmod(temporary, 0o600)
+            handle.write(json.dumps(data, indent=2) + '\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 def escape_compose(value):
     """Preserve literal dollars when saved runtime values pass through Compose again."""
@@ -374,10 +382,8 @@ def snapshot(repo, destination, volume_image=None):
             raise ValueError(f'Unsafe build source path: {name}')
         if any(part in {'.git', '.devcontainer', '.vscode', 'node_modules', '.gradle'} for part in p.parts):
             continue
-        static_source = p.parts[:2] in {
-            ('static_source', directory) for directory in ('js', 'lib', 'themes', 'pages', 'extensions', 'common')
-        }
-        if any(part in {'build', 'dist'} for part in p.parts) and not static_source:
+        # Only root-level output directories are generated; nested build/dist folders may be real source.
+        if p.parts[0] in {'build', 'dist'} and len(p.parts) > 1:
             continue
         if p.name in {'.npmrc', '.env', 'auth.pubkey.pem'} or p.suffix in {'.pem', '.key'} or p.name.startswith('.env.') or p.name.endswith('.local.env'):
             continue
@@ -686,9 +692,10 @@ def clean(state, targets, keep_builds, dry_run):
             keep_images.add(inspect(f"{state['project']}-{service}-1")['Config']['Image'])
         except subprocess.CalledProcessError:
             pass
+    prefixes = tuple(f'local/{state["project"]}-{key}:' for key in targets)
     existing = output(['docker', 'images', '--format', '{{.Repository}}:{{.Tag}}',
                         '--filter', f'reference=local/{state["project"]}-*']).split()
-    removable = sorted(set(existing) - keep_images)
+    removable = sorted(image for image in set(existing) - keep_images if image.startswith(prefixes))
     verb = 'Would remove' if dry_run else 'Removing'
     if removable:
         print(f'{verb} unused local images:')
@@ -710,8 +717,6 @@ def clean(state, targets, keep_builds, dry_run):
                 shutil.rmtree(path)
     else:
         print('No stale build snapshots to remove.')
-    if not dry_run:
-        subprocess.run(['docker', 'image', 'prune', '-f'], check=False)
 
 
 def deploy(state, targets):
@@ -749,7 +754,9 @@ def main():
     parser.add_argument('--npmrc', help='Private npm config mounted as a BuildKit secret')
     parser.add_argument('--jobs', type=int, choices=range(1, 5), default=2)
     parser.add_argument('--dry-run', action='store_true', help='clean: list what would be removed without removing it')
-    parser.add_argument('--keep-builds', type=int, default=2, help='clean: most recent build snapshots to retain per target selection')
+    parser.add_argument('--keep-builds', type=int, default=2,
+                        help='clean: most recent build snapshots to retain across all targets (0 keeps all); '
+                             'the latest build is always kept and --only/--exclude do not apply')
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument('--only', nargs='+', choices=TARGETS, help='Build/manage only these repositories or runtime targets')
     selection.add_argument('--exclude', nargs='+', choices=TARGETS, help='Leave these repositories or runtime targets to Dev Containers')
