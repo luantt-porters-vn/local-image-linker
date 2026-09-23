@@ -10,7 +10,9 @@ ENV JAVA_TOOL_OPTIONS=-Dfile.encoding=UTF-8
 ENV JAVA_HOME=/opt/feature-java
 ENV PATH=/opt/feature-java/bin:${PATH}
 
-COPY api/ /src/
+# Only the Java sources and their synthetic history: PHP/static edits must not invalidate the Gradle build.
+COPY api/.git/ /src/.git/
+COPY api/api_source/ /src/api_source/
 WORKDIR /src/api_source
 # Publish shared modules in dependency order before assembling the consuming WAR.
 RUN --mount=type=cache,target=/root/.gradle \
