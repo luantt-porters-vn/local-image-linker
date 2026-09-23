@@ -448,6 +448,28 @@ class BuildProgress:
                 self.last_report = time.monotonic()
 
 
+def prepare_api_history(checkout, tag):
+    """Give Gradle's version detection a tagged, clean history of api_source only.
+
+    Fixed identity and dates plus a stat-free index make .git byte-identical whenever api_source
+    is, so edits elsewhere in the HRBC repo (PHP, static assets) keep the Docker build cache.
+    """
+    identity = {'GIT_AUTHOR_NAME': 'Feature Build', 'GIT_AUTHOR_EMAIL': 'feature@localhost',
+                'GIT_AUTHOR_DATE': '2000-01-01T00:00:00Z', 'GIT_COMMITTER_NAME': 'Feature Build',
+                'GIT_COMMITTER_EMAIL': 'feature@localhost', 'GIT_COMMITTER_DATE': '2000-01-01T00:00:00Z'}
+    env = {**os.environ, **identity}
+    run(['git', 'init', '-q', '-b', 'main', checkout])
+    # Automatic gc would pack objects into files named nondeterministically; keep them loose.
+    run(['git', '-C', checkout, 'config', 'gc.auto', '0'])
+    run(['git', '-C', checkout, 'config', 'maintenance.auto', 'false'])
+    run(['git', '-C', checkout, 'add', 'api_source'])
+    run(['git', '-C', checkout, 'commit', '-q', '--no-verify', '-m', 'Integration source snapshot'], env=env)
+    run(['git', '-C', checkout, 'tag', tag])
+    # The index records inode/ctime of this particular copy; rebuild it from HEAD without stat data.
+    (checkout / '.git' / 'index').unlink()
+    run(['git', '-C', checkout, 'read-tree', 'HEAD'])
+
+
 def build(args, state):
     """Build isolated snapshots concurrently; publish image selections only on success."""
     overall_started = time.monotonic()
@@ -476,10 +498,7 @@ def build(args, state):
         shutil.copy2(BUNDLE / 'web-static.conf', context / 'web-static.conf')
     # Version detection reads Git metadata, but never expose the source .git configuration.
     if 'api' in source_keys:
-        run(['git', 'init', '-q', context / 'api'])
-        run(['git', '-C', context / 'api', 'add', '.'])
-        run(['git', '-C', context / 'api', '-c', 'user.name=Feature Build', '-c', 'user.email=feature@localhost', 'commit', '-qm', 'Integration source snapshot'])
-        run(['git', '-C', context / 'api', 'tag', output(['git', '-C', repos['api'], 'describe', '--tags', '--abbrev=0']).strip()])
+        prepare_api_history(context / 'api', output(['git', '-C', repos['api'], 'describe', '--tags', '--abbrev=0']).strip())
     images = {}
     for key in args.targets:
         sha = metadata[key]['sha'][:12]
