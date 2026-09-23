@@ -123,12 +123,15 @@ state holds the original images needed for **Restore**; do not delete it.
 
 Open the **Command Palette ▸ Tasks: Run Task**, then pick one of the tasks below.
 Most tasks prompt with a dropdown for an optional target (`ui`, `proxy`, `api`,
-`web`, `hrbc`, `api-client-privateapi`); leave it blank to select all services.
+`web`, `hrbc`, `api-client-privateapi`, or a common combination such as
+`ui proxy`); leave it blank to select all services. For other combinations, run
+the scripts directly (see [Running The Scripts Directly](#extra-running-the-scripts-directly)).
 
 | Task | What it does |
 | --- | --- |
 | **Local Image Linker: Build** | Snapshots your working trees and runs `docker build` for the selected target(s). Does not deploy anything yet. |
 | **Local Image Linker: Deploy** | Swaps the selected running containers to the last built local images and waits for their health checks. |
+| **Local Image Linker: Build & Deploy** | Runs Build, then Deploy with the same target. Deploy is skipped if the build fails. |
 | **Local Image Linker: Restore** | Puts the selected services back on their original saved images. Database data is untouched. |
 | **Local Image Linker: Status** | Shows each selected service's container health and which image/commit it's currently running. |
 | **Local Image Linker: Stop** | Stops the selected containers without changing their configured image. |
@@ -142,14 +145,13 @@ Most tasks prompt with a dropdown for an optional target (`ui`, `proxy`, `api`,
 2. If a Dev Container is currently network-connected to a service you're about to
    replace, disconnect it first (its existing network-disconnect task) — Deploy
    refuses to proceed while another container still holds that DNS alias.
-3. Run task **Local Image Linker: Build**, choosing your target — the first build ever
-   automatically captures the cluster's original images as a restore baseline. It
-   does not replace any container by itself.
-4. Run task **Local Image Linker: Deploy** with the same target to swap it into the
-   cluster, then test as normal.
-5. Repeat steps 1, 3, 4 every time you want your latest changes reflected — there
+3. Run task **Local Image Linker: Build & Deploy**, choosing your target — the first
+   build ever automatically captures the cluster's original images as a restore
+   baseline. If the build fails, nothing is deployed and the previous images stay
+   running. (Build and Deploy are also available as separate tasks.)
+4. Repeat steps 1, 3 every time you want your latest changes reflected — there
    is no watch mode; each run is a fresh snapshot and a fresh `docker build`.
-6. When finished, run task **Local Image Linker: Restore** with the same target to put
+5. When finished, run task **Local Image Linker: Restore** with the same target to put
    the original image back.
 
 Deploy and Restore restart only the routers affected by the selected applications:
