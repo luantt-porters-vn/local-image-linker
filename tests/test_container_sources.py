@@ -1,9 +1,13 @@
+from contextlib import ExitStack
 import importlib.util
+import io
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import tarfile
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -35,21 +39,33 @@ class ContainerSourceTests(unittest.TestCase):
     def git(self, *args):
         return subprocess.check_output(['git', '-C', str(self.repo), *args]).decode().strip()
 
-    def copy_from_docker(self, args, **kwargs):
-        self.assertEqual(args[:3], ['docker', 'cp', 'ui-dev:/workspaces/hrbc-ui-react/.'])
-        self.copied_to = Path(args[3])
-        shutil.copytree(self.repo, self.copied_to, dirs_exist_ok=True, symlinks=True)
+    def docker_cp(self, returncode=0):
+        """Serve self.repo the way `docker cp <container>:<path>/. -` streams it, recording the copy target."""
+        real_popen = subprocess.Popen
+        def popen(args, *rest, **kwargs):
+            if args[0] != 'docker':
+                return real_popen(args, *rest, **kwargs)
+            self.assertEqual(args, ['docker', 'cp', 'ui-dev:/workspaces/hrbc-ui-react/.', '-'])
+            buffer = io.BytesIO()
+            if not returncode:
+                with tarfile.open(fileobj=buffer, mode='w') as archive:
+                    archive.add(self.repo, arcname='.')
+                buffer.seek(0)
+            return SimpleNamespace(stdout=buffer, returncode=returncode, wait=lambda: returncode)
+        copy = feature.copy_container_checkout
+        def record(container, source, checkout, label):
+            self.copied_to = checkout
+            return copy(container, source, checkout, label)
+        stack = ExitStack()
+        stack.enter_context(patch.object(feature.subprocess, 'Popen', side_effect=popen))
+        stack.enter_context(patch.object(feature, 'copy_container_checkout', side_effect=record))
+        return stack
 
     def test_container_snapshot_matches_local_saved_working_tree(self):
         local = self.root / 'local'
         expected = feature.snapshot(self.repo, local)
         destination = self.root / 'container'
-        actual_run = feature.run
-        def run(args, **kwargs):
-            if args[0] == 'docker':
-                return self.copy_from_docker(args, **kwargs)
-            return actual_run(args, **kwargs)
-        with patch.object(feature, 'run', side_effect=run):
+        with self.docker_cp():
             actual = feature.snapshot('docker://ui-dev/workspaces/hrbc-ui-react', destination)
         files = lambda directory: {str(p.relative_to(directory)): p.read_bytes() for p in directory.rglob('*') if p.is_file()}
         self.assertEqual(files(destination), files(local))
@@ -118,19 +134,43 @@ class ContainerSourceTests(unittest.TestCase):
         self.assertEqual(paths['ui'], 'volume://hrbc-ui')
 
     def test_missing_container_has_actionable_error_and_cleans_up(self):
-        def fail(args, **kwargs):
-            self.copied_to = Path(args[3])
-            raise subprocess.CalledProcessError(1, args)
-        with patch.object(feature, 'run', side_effect=fail), self.assertRaisesRegex(ValueError, 'container must still exist'):
+        with self.docker_cp(returncode=1), self.assertRaisesRegex(ValueError, 'container must still exist'):
             feature.snapshot('docker://ui-dev/workspaces/hrbc-ui-react', self.root / 'out')
         self.assertFalse(self.copied_to.exists())
 
     def test_linked_worktree_rejected_and_temporary_copy_removed(self):
         shutil.rmtree(self.repo / '.git')
         (self.repo / '.git').write_text('gitdir: /unavailable/worktree')
-        with patch.object(feature, 'run', side_effect=self.copy_from_docker), self.assertRaisesRegex(ValueError, 'linked worktrees'):
+        with self.docker_cp(), self.assertRaisesRegex(ValueError, 'linked worktrees'):
             feature.snapshot('docker://ui-dev/workspaces/hrbc-ui-react', self.root / 'out')
         self.assertFalse(self.copied_to.exists())
+
+    def test_container_copy_never_writes_dependency_trees(self):
+        (self.repo / 'packages/app/node_modules/dep').mkdir(parents=True)
+        (self.repo / 'packages/app/node_modules/dep/index.js').write_text('dep')
+        (self.repo / '.gradle/caches').mkdir(parents=True)
+        written = []
+        extract = tarfile.TarFile.extract
+        def spy(archive, member, *args, **kwargs):
+            written.append(member.name)
+            return extract(archive, member, *args, **kwargs)
+        with self.docker_cp(), patch.object(tarfile.TarFile, 'extract', spy):
+            feature.snapshot('docker://ui-dev/workspaces/hrbc-ui-react', self.root / 'out')
+        self.assertIn('./tracked.js', written)
+        self.assertFalse([name for name in written if 'node_modules' in name or '.gradle' in name])
+
+    def test_escaping_link_fails_only_when_it_is_build_source(self):
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (outside / 'secret').write_text('secret')
+        (self.repo / 'ignored.js').unlink()
+        (self.repo / 'ignored.js').symlink_to(outside / 'secret')
+        with self.docker_cp():
+            feature.snapshot('docker://ui-dev/workspaces/hrbc-ui-react', self.root / 'ignored')
+        self.assertFalse((self.root / 'ignored/ignored.js').exists())
+        (self.repo / 'leak').symlink_to(outside, target_is_directory=True)
+        with self.docker_cp(), self.assertRaisesRegex(ValueError, 'Symlink in build source requires review: .*/leak'):
+            feature.snapshot('docker://ui-dev/workspaces/hrbc-ui-react', self.root / 'tracked')
 
     def test_symlinked_directory_cannot_leak_files(self):
         outside = self.root / 'outside'
