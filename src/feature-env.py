@@ -18,6 +18,7 @@ import subprocess
 import sys
 import uuid
 import shlex
+import tarfile
 import tempfile
 
 BUNDLE = Path(__file__).resolve().parent
@@ -323,6 +324,40 @@ def prepare(args):
     save(STATE / 'state.json', {'project': args.project, 'source': args.source, 'repos': str(Path(args.repos or BUNDLE.parent / 'hrbc').expanduser().resolve()), 'originals': originals, 'release': args.release, 'daemon': output(['docker', 'info', '--format', '{{.ID}}']).strip()})
     print(f'Prepared image overrides for existing {args.source}; no containers changed.')
 
+def copy_container_checkout(container, source, checkout, label):
+    """Stream a container checkout as tar, never writing dependency trees snapshot() excludes anyway.
+
+    Returns member names the tar 'data' filter rejected (links escaping the checkout).
+    """
+    if not hasattr(tarfile, 'data_filter'):
+        raise ValueError('Container sources need a Python with tarfile extraction filters (3.12+, or 3.9.17+/3.10.12+/3.11.4+)')
+    process = subprocess.Popen(['docker', 'cp', f'{container}:{source}/.', '-'],
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    rejected = []
+    unreadable = None
+    try:
+        with tarfile.open(fileobj=process.stdout, mode='r|') as archive:
+            for member in archive:
+                name = os.path.normpath(member.name)
+                if any(part in {'node_modules', '.gradle'} for part in Path(name).parts):
+                    continue
+                try:
+                    archive.extract(member, checkout, filter='data')
+                except tarfile.FilterError:
+                    rejected.append(Path(name).as_posix())
+    except tarfile.ReadError as error:
+        unreadable = error  # expected when docker cp fails before sending an archive
+    finally:
+        process.stdout.close()
+        process.wait()
+    if process.returncode:
+        raise ValueError(f'Cannot copy {label}; check the container name and repository path. '
+                         'The container must still exist, but may be stopped.')
+    if unreadable:
+        raise ValueError(f'Cannot read the archive copied from {label}: {unreadable}')
+    return rejected
+
+
 def snapshot(repo, destination, volume_image=None):
     """Copy saved working-tree source while excluding credentials and generated output."""
     if isinstance(repo, str) and repo.startswith('volume://'):
@@ -348,20 +383,27 @@ def snapshot(repo, destination, volume_image=None):
             run(['docker', 'rm', '-v', helper], stdout=subprocess.DEVNULL)
     if isinstance(repo, str) and repo.startswith('docker://'):
         container, source = container_source(repo)
-        # docker cp also reads stopped containers. Keep the complete checkout outside
-        # the Docker build context and remove it even when validation/copying fails.
+        # docker cp also reads stopped containers. Keep the checkout outside the Docker
+        # build context and remove it even when validation/copying fails.
         with tempfile.TemporaryDirectory(prefix='image-linker-source-') as temporary:
             checkout = Path(temporary) / 'repo'
             checkout.mkdir()
-            try:
-                run(['docker', 'cp', f'{container}:{source}/.', checkout])
-            except subprocess.CalledProcessError:
-                raise ValueError(f'Cannot copy {repo}; check the container name and repository path. '
-                                 'The container must still exist, but may be stopped.') from None
+            rejected = copy_container_checkout(container, source, checkout, repo)
             if not (checkout / '.git').is_dir() or (checkout / '.git').is_symlink():
                 raise ValueError(f'{repo}: expected a standalone Git checkout with a .git directory; '
                                  'linked worktrees are not supported for container sources')
             validate_repository(checkout, repo)
+            if rejected:
+                # Rejected links are absent from the copy, so ask Git whether each would have been build
+                # source (tracked or non-ignored); such a file must not silently disappear from the image.
+                check = subprocess.run(['git', '-C', str(checkout), 'check-ignore', '-z', '--stdin'],
+                                       input='\0'.join(rejected).encode(), stdout=subprocess.PIPE)
+                if check.returncode not in (0, 1):
+                    raise ValueError(f'{repo}: cannot check ignored links')
+                ignored = set(check.stdout.decode().split('\0'))
+                used = [name for name in rejected if name not in ignored]
+                if used:
+                    raise ValueError(f'Symlink in build source requires review: {repo}/{used[0]}')
             metadata = snapshot(checkout, destination)
             metadata['repository'] = repo
             return metadata
