@@ -128,6 +128,10 @@ Most tasks prompt with a dropdown for an optional target (`ui`, `proxy`, `api`,
 | Task | What it does |
 | --- | --- |
 | **Local Image Linker: Build** | Snapshots your working trees and runs `docker build` for the selected target(s). Does not deploy anything yet. |
+| **Local Image Linker: Build & Share** | Builds selected images, exports a bundle, and temporarily shares it over pinned HTTPS on the LAN. |
+| **Local Image Linker: Share Last Build** | Shares selected existing builds without rebuilding. |
+| **Local Image Linker: Pull Shared** | Prompts for a share link, validates and imports its images without building or deploying. |
+| **Local Image Linker: Stop Sharing** | Ends the active share in this state directory and requests temporary bundle cleanup. |
 | **Local Image Linker: Deploy** | Swaps the selected running containers to the last built local images and waits for their health checks. |
 | **Local Image Linker: Restore** | Puts the selected services back on their original saved images. Database data is untouched. |
 | **Local Image Linker: Status** | Shows each selected service's container health and which image/commit it's currently running. |
@@ -158,10 +162,113 @@ Selecting both groups restarts both routers.
 
 ### What you'll see during a build
 
+All tasks use consistent headers, named stages, status labels and completion
+timings. Interactive terminals use color and in-place progress; captured logs
+remain plain text. Set `NO_COLOR=1` to disable color. Metadata wraps to the
+terminal width; share links stay intact so the complete secret link can be copied.
+Docker diagnostic output remains visible when commands run or fail.
+
 The task's terminal updates in place, one row per image, showing status, elapsed
 time, and the current Docker step. Full Docker output is saved to
 `builds/<build-id>/<target>.log`; a failure message includes the path to the
 relevant log.
+
+### Sharing builds over the LAN
+
+Both computers need the updated linker, Docker, and their own already-running HRBC
+cluster. The release and image CPU architecture must match. The receiver does not
+need application source repositories or build credentials. Its existing cluster
+setup, including `devcontainer-settings`, is still needed to capture a local
+Restore baseline. CLI users need their usual `src/.env`; receivers can omit all
+repository settings and leave release detection automatic.
+
+1. Giver: run **Build & Share**, select services, and keep the task running.
+   Use **Share Last Build** to avoid rebuilding an existing successful selection.
+   In WSL NAT mode, approve the Windows administrator (UAC) prompt using the
+   same Windows account. The task configures temporary LAN access automatically.
+2. Send the complete displayed link to the coworker through a trusted channel.
+   Its token and certificate fingerprint are secret; do not post it publicly.
+3. Receiver: run **Pull Shared** and paste the link into its terminal prompt.
+   All services in that share are imported. No source checkout is required.
+4. Receiver: run **Deploy**, selecting only the imported services. Pull never
+   deploys automatically. **Restore** uses the receiver's original cluster images,
+   not the giver's configuration. On first pull, the local baseline is captured.
+5. Giver: run **Stop Sharing**, press Ctrl+C in the sharing terminal, or let it
+   expire (60 minutes after export by default). Normal shutdown removes the
+   temporary image bundle and TLS key. Keep the computer awake until pulls finish.
+
+Only an image archive and selected source provenance are exposed. No file browser,
+Docker socket, source snapshots, cluster settings, or database export is served.
+Images themselves can still contain code or embedded secrets: only accept images
+from trusted coworkers. A pinned certificate protects the transfer, not the safety
+of the software inside an image. No cloud upload or Docker registry is used.
+
+Sharing binds to one private IPv4 interface and accepts peers from its subnet.
+With multiple eligible interfaces, the task asks which address to use. This is
+LAN restriction, not proof that peers use the same Wi-Fi name. VPNs, routers and
+NAT can change reachability or hide peer addresses; the host firewall must also
+restrict access. Never expose the sharing port through public router forwarding.
+
+TLS uses host OpenSSL when available. Otherwise Docker obtains an
+`alpine/openssl:latest` helper automatically; only the temporary certificate
+directory is mounted and the helper runs without network access. That first
+helper download requires registry access, but no manual package installation.
+
+The task reports the selected interface, likely WSL/container exposure issues,
+authorized download starts, transfer progress, compatibility failures and checksum
+failures. Native Linux sharing does not change privileged network settings.
+
+For WSL NAT, the giver task detects the Windows LAN address and requests one
+explicit Windows UAC approval. An elevated helper creates a TCP port-forward and
+an inbound firewall rule restricted to that address, port, interface and its
+actual LAN subnet. It does not disable the firewall, change the network profile,
+install a service, or configure public router forwarding. The displayed share
+link already uses the Windows LAN address; receivers just paste it as shown.
+If multiple Windows networks are active, the task asks which LAN to use.
+
+Stop Sharing, Ctrl+C and expiry request removal of only the session's own rules,
+without a second UAC prompt. A Windows-side watchdog removes them after about
+30 seconds without a changing WSL heartbeat, covering unexpected task exits.
+Cleanup is confirmed before temporary helper files are removed. If cleanup
+cannot be confirmed, the task retains recovery records in the Windows temporary
+directory and reports the owned rule and forwarding endpoint. Windows crashes,
+power loss, security-policy restrictions or forcibly killing the elevated helper
+can still leave persistent rules requiring manual removal. Existing/manual rules
+are never overwritten or deleted: remove an old manual forwarding rule yourself,
+or select another sharing port. WSL mirrored mode and generic containers do not
+use this NAT helper and may still require host/firewall configuration.
+
+| Symptom | What to check |
+| --- | --- |
+| Cannot bind / port in use | Stop an existing share or select a different sharing port. |
+| Receiver connection timeout | Confirm the giver task is running, both devices can reach the LAN, and the giver's private-network firewall allows the port. Guest Wi-Fi/client isolation can prevent peer connections. A timeout cannot uniquely identify the cause. |
+| Giver runs inside WSL NAT | Approve the task's Windows UAC prompt. Use its displayed Windows LAN link unchanged. Windows PowerShell, WSL interoperability, Windows-drive mounting and a running IP Helper service are required. |
+| Windows forwarding setup fails | Check the helper's error. Cancelled UAC can be retried; an old manual forwarding rule must be removed manually or a different sharing port selected. The task does not take ownership of existing rules. |
+| Giver runs inside a container / WSL mirrored mode | Use a LAN-reachable interface and verify host/firewall exposure. The automatic Windows NAT helper does not configure these modes. |
+| Certificate fingerprint mismatch | Stop and obtain the current link directly from the giver. Never bypass verification. |
+| Link unavailable / expired | Ask the giver for the link from the currently running share. Each share has a fresh token and certificate. |
+| Release or architecture mismatch | Start a matching HRBC release or request a build for the receiver's Docker architecture. No automatic emulation or cross-release deployment. |
+| Not enough storage / Docker load failed | Free staging disk space and check Docker daemon/Desktop storage limits. Images may consume additional daemon storage. |
+
+CLI equivalents (from `src`):
+
+```bash
+bash run/feature-env.sh build-share --only ui proxy
+bash run/feature-env.sh share --only ui proxy
+bash run/feature-env.sh pull-shared
+bash run/feature-env.sh stop-sharing
+
+# Optional giver overrides; defaults require no sharing configuration.
+bash run/feature-env.sh share --only ui --share-address 192.168.1.20 --share-port 8443 --share-minutes 30
+```
+
+Sharing runs in the foreground but releases the cluster lock after export, so
+Deploy/Status/Restore can run while a share is active. Pull takes the normal
+cluster lock while importing. A failed download or validation leaves deployment
+selections unchanged; images are registered only after a successful Docker load.
+Forced process termination or a system crash can leave `sharing-*`/`pull-*`
+temporary directories in the state directory; remove these only after confirming
+no sharing/import process is using them. Never delete the restore state.
 
 ## 4. Troubleshooting
 

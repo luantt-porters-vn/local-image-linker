@@ -2,7 +2,44 @@
     // See https://go.microsoft.com/fwlink/?LinkId=733558
     // for the documentation about the tasks.json format
     "version": "2.0.0",
+    "presentation": {
+        "echo": false,
+        "reveal": "always",
+        "panel": "dedicated",
+        "showReuseMessage": false
+    },
     "tasks": [
+        {
+            "label": "Local Image Linker: Build & Share",
+            "type": "shell",
+            "command": "bash \"${workspaceFolder}/src/run/feature-env.sh\" build-share ${ONLY:+--only $ONLY}",
+            "options": {
+                "env": { "ONLY": "${input:imagesLinkerOnly}" }
+            },
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "Local Image Linker: Share Last Build",
+            "type": "shell",
+            "command": "bash \"${workspaceFolder}/src/run/feature-env.sh\" share ${ONLY:+--only $ONLY}",
+            "options": {
+                "env": { "ONLY": "${input:imagesLinkerOnly}" }
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Local Image Linker: Pull Shared",
+            "type": "shell",
+            "command": "bash \"${workspaceFolder}/src/run/feature-env.sh\" pull-shared",
+            "problemMatcher": []
+        },
+        {
+            "label": "Local Image Linker: Stop Sharing",
+            "type": "shell",
+            "command": "bash \"${workspaceFolder}/src/run/feature-env.sh\" stop-sharing",
+            "problemMatcher": []
+        },
         {
             "label": "Local Image Linker: Build",
             "type": "shell",

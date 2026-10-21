@@ -5,6 +5,7 @@ Launchers live in run/ and image recipes in docker/. Configuration and private
 restore/build state remain relative to this file, independent of the caller's cwd.
 """
 import argparse
+import importlib.util
 import concurrent.futures
 import fcntl
 import threading
@@ -19,6 +20,14 @@ import sys
 import uuid
 import shlex
 import tempfile
+
+try:
+    from terminal_ui import ui
+except ModuleNotFoundError:
+    terminal_spec = importlib.util.spec_from_file_location('terminal_ui', Path(__file__).with_name('terminal_ui.py'))
+    terminal_module = importlib.util.module_from_spec(terminal_spec)
+    terminal_spec.loader.exec_module(terminal_module)
+    ui = terminal_module.ui
 
 BUNDLE = Path(__file__).resolve().parent
 STATE = BUNDLE / '.feature-env'
@@ -109,7 +118,7 @@ def heal_stray_renames(state):
             continue  # nothing to repair, or ambiguous; let the normal flow surface the error
         current = inspect(ids[0])['Name'].lstrip('/')
         if current != expected:
-            print(f'Repairing interrupted container swap: {current} -> {expected}', flush=True)
+            ui.warning(f'Repairing interrupted container swap: {current} -> {expected}')
             run(['docker', 'rename', current, expected])
 
 def container_source(value):
@@ -199,9 +208,9 @@ def ensure_current_baseline(args, state):
     previous = baseline_release(state)
     if previous == args.release:
         return state
-    if args.command != 'build':
+    if args.command not in {'build', 'build-share', 'pull-shared'}:
         raise ValueError(f'Saved baseline release {previous or "unknown"} differs from cluster {args.release}. '
-                         'Run Build to refresh the baseline before deploying or restoring.')
+                         'Run Build or Pull Shared to refresh the baseline before deploying or restoring.')
     for service in SERVICES.values():
         image = inspect(f'{state["project"]}-{service}-1')['Config']['Image']
         if image.startswith('local/'):
@@ -228,7 +237,8 @@ def ensure_current_baseline(args, state):
             (replacement / name).replace(STATE / name)
         for name in ('build.json', 'feature.json', 'routing.json'):
             (STATE / name).unlink(missing_ok=True)
-        print(f'Cluster release changed: {previous} -> {args.release}. Previous state: {backup}', flush=True)
+        ui.info(f'Cluster release changed: {previous} -> {args.release}')
+        ui.detail('Backup', backup)
     return json.loads((STATE / 'state.json').read_text())
 
 
@@ -321,7 +331,7 @@ def prepare(args):
     config['name'] = args.project
     save(STATE / 'normal.json', escape_compose(config))
     save(STATE / 'state.json', {'project': args.project, 'source': args.source, 'repos': str(Path(args.repos or BUNDLE.parent / 'hrbc').expanduser().resolve()), 'originals': originals, 'release': args.release, 'daemon': output(['docker', 'info', '--format', '{{.ID}}']).strip()})
-    print(f'Prepared image overrides for existing {args.source}; no containers changed.')
+    ui.success(f'Captured the Restore baseline for {args.source}; no containers changed')
 
 def snapshot(repo, destination, volume_image=None):
     """Copy saved working-tree source while excluding credentials and generated output."""
@@ -434,6 +444,7 @@ class BuildProgress:
                 width = max(1, shutil.get_terminal_size().columns - 1)
                 done = sum(row['status'] == 'Built' for row in self.rows.values())
                 lines = [f'Building images [{done}/{len(self.rows)}]']
+                lines += [f'  {"TARGET":<7} {"STATUS":<10} {"ELAPSED":>6}  CURRENT STEP']
                 lines += [self.format_row(key, row) for key, row in self.rows.items()]
                 if self.lines:
                     self.stream.write(f'\x1b[{self.lines}A')
@@ -452,8 +463,10 @@ def build(args, state):
     """Build isolated snapshots concurrently; publish image selections only on success."""
     overall_started = time.monotonic()
     repos = repository_paths(state, args.targets, args.repos)
-    print(f'Build targets: {", ".join(args.targets)} | parallel jobs: {args.jobs}', flush=True)
-    print(json.dumps({'source_paths': {key: str(repo) for key, repo in repos.items()}}, indent=2), flush=True)
+    ui.section('Source Repositories')
+    ui.detail('Parallel jobs', args.jobs)
+    for key, repo in repos.items():
+        ui.detail(key, repo)
     if args.add_host:
         state['build_hosts'] = args.add_host
         save(STATE / 'state.json', state)
@@ -467,11 +480,11 @@ def build(args, state):
     if 'ui' in source_keys:
         source_keys.add('client')
     for position, (key, repo) in enumerate(repos.items(), 1):
-        print(f'[{position}/{len(repos)}] Snapshot {key}: {repo}', flush=True)
+        ui.step(f'Snapshot {position}/{len(repos)}: {key}')
         metadata[key] = snapshot(repo, context / key, volume_image=state['originals'][SERVICES[key]]
                                  if key in {'ui', 'proxy'} else None)
         meta = metadata[key]
-        print(f'[{key}] Snapshot ready | {meta["branch"]} | {meta["sha"][:12]} | dirty={meta["dirty"]}', flush=True)
+        ui.detail(key, f'{meta["branch"]} | {meta["sha"][:12]} | {"saved changes" if meta["dirty"] else "clean"}')
     if 'web' in source_keys:
         shutil.copy2(BUNDLE / 'web-static.conf', context / 'web-static.conf')
     # Version detection reads Git metadata, but never expose the source .git configuration.
@@ -486,7 +499,9 @@ def build(args, state):
         images[key] = f'local/{state["project"]}-{key}:feature-{sha}-{build_id}'
     failed = threading.Event()
     display = BuildProgress(args.targets)
-    print(f'Full build logs: {context}/<target>.log', flush=True)
+    ui.section('Docker Build')
+    ui.detail('Full logs', f'{context}/<target>.log')
+    ui.line()
     def one(key):
         if failed.is_set():
             raise ValueError('Cancelled after another build failed')
@@ -559,10 +574,12 @@ def build(args, state):
     save(STATE / 'feature.json', {'services': {SERVICES[key]: {'image': image, 'pull_policy': 'never'} for key, image in all_images.items()}})
     save(STATE / 'build.json', {'repositories': all_metadata, 'images': all_images, 'build_id': build_id,
                               'releases': {**previous.get('releases', {}), **{key: args.release for key in args.targets}}})
-    print(json.dumps({'repositories': metadata, 'images': images}, indent=2))
+    ui.section('Built Images')
+    for key, image in images.items():
+        ui.detail(key, image)
     elapsed = int(time.monotonic() - overall_started)
-    print(f'Build completed in {elapsed}s. Images are built, not deployed.', flush=True)
-    print('Next: bash', shlex.quote(str(BUNDLE / 'run' / 'deploy.sh')), '--only', *args.targets, flush=True)
+    ui.success(f'Build completed in {elapsed}s. Images are built, not deployed.')
+    ui.detail('Next', f'Run Deploy for {", ".join(args.targets)}')
 
 def compose(state, feature=True):
     """Use the saved baseline, optionally overlaid with successfully built local images."""
@@ -574,18 +591,25 @@ def compose(state, feature=True):
 def summary(state, targets=None):
     """Show actual container health and provenance only when its image matches the build."""
     provenance = json.loads((STATE / 'build.json').read_text()) if (STATE / 'build.json').exists() else {}
+    ui.section('Service Status')
     for key in targets if targets is not None else SERVICES:
         service = SERVICES[key]
         container = inspect(state['project'] + '-' + service + '-1')
         current = container['Config']['Image']
         status = container['State'].get('Health', {}).get('Status', container['State']['Status'])
         meta = provenance.get('repositories', {}).get(key, {}) if current == provenance.get('images', {}).get(key) else {}
-        print(f"{service}: {status} | {current}")
+        ui.line()
+        if status in {'healthy', 'running'}:
+            ui.success(f'{key} / {service}: {status}')
+        else:
+            ui.warning(f'{key} / {service}: {status}')
+        ui.detail('Image', current)
         if meta:
-            print(f"  {meta['repository']} | {meta['branch']} | {meta['sha']} | dirty={meta['dirty']}")
+            ui.detail('Source', meta['repository'])
+            ui.detail('Revision', f'{meta["branch"]} | {meta["sha"][:12]} | {"saved changes" if meta["dirty"] else "clean"}')
         if key == 'ui' and meta:
             client = provenance['repositories']['client']
-            print(f"  bundled client: {client['repository']} | {client['branch']} | {client['sha']} | dirty={client['dirty']}")
+            ui.detail('Client', f'{client["branch"]} | {client["sha"][:12]} | {"saved changes" if client["dirty"] else "clean"}')
 
 
 def check_redirects(state, targets):
@@ -637,6 +661,7 @@ def start_dependencies(state, after_apps=False):
             continue
         container = state['project'] + '-' + name + '-1'
         if not inspect(container)['State']['Running']:
+            ui.step(f'Starting dependency: {name}')
             run(['docker', 'start', container])
 
 
@@ -648,6 +673,7 @@ def restart_routing(state, targets):
     if set(targets).intersection({'ui', 'proxy', 'web'}):
         routers.append('hrbcweblb')
     if routers:
+        ui.step(f'Refreshing routing: {", ".join(routers)}')
         run(['docker', 'restart', *[state['project'] + '-' + router + '-1' for router in routers]])
 
 
@@ -666,7 +692,7 @@ def refresh_web_routing(state):
     if not re.fullmatch(r'path_beg /P-[0-9]+(?:\.[0-9]+)+/tsbundle', current):
         raise ValueError('Unexpected web React routing rule; review FRONTEND_REACT before deployment')
     save(STATE / 'routing.json', {'services': {'hrbcweblb': {'environment': {'FRONTEND_REACT': desired}}}})
-    print(f'Aligning web React routing with deployed PHP: {current} -> {desired}', flush=True)
+    ui.step(f'Aligning web React routing: {current} -> {desired}')
     run(compose(state, False) + ['-f', STATE / 'routing.json', 'up', '-d', '--no-deps',
                                 '--wait', '--wait-timeout', '180', '--pull', 'never', 'hrbcweblb'])
 
@@ -690,28 +716,33 @@ def clean(state, targets, keep_builds, dry_run):
                         '--filter', f'reference=local/{state["project"]}-*']).split()
     removable = sorted(set(existing) - keep_images)
     verb = 'Would remove' if dry_run else 'Removing'
+    ui.section('Image Cleanup Preview' if dry_run else 'Image Cleanup')
     if removable:
-        print(f'{verb} unused local images:')
+        ui.info(f'{verb} {len(removable)} unused local image reference(s)')
         for image in removable:
-            print(' ', image)
+            ui.detail('Image', image)
         if not dry_run:
             subprocess.run(['docker', 'rmi'] + removable, check=False)
     else:
-        print('No unused local images to remove.')
+        ui.success('No unused local images to remove')
     builds_dir = STATE / 'builds'
     all_builds = sorted((p for p in builds_dir.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime) if builds_dir.exists() else []
     boundary = len(all_builds) - keep_builds if keep_builds > 0 else 0
     stale_builds = [p for p in all_builds[:max(boundary, 0)] if p.name != build_info.get('build_id')]
+    ui.section('Build Snapshot Cleanup')
     if stale_builds:
-        print(f'{verb} stale build snapshots:')
+        ui.info(f'{verb} {len(stale_builds)} stale build snapshot(s)')
         for path in stale_builds:
-            print(' ', path)
+            ui.detail('Snapshot', path)
             if not dry_run:
                 shutil.rmtree(path)
     else:
-        print('No stale build snapshots to remove.')
+        ui.success('No stale build snapshots to remove')
     if not dry_run:
+        ui.warning('Pruning unused dangling images across this Docker daemon')
         subprocess.run(['docker', 'image', 'prune', '-f'], check=False)
+    else:
+        ui.info('Preview only. No images or files were removed.')
 
 
 def deploy(state, targets):
@@ -724,8 +755,11 @@ def deploy(state, targets):
         raise ValueError('Build selected services before deploying: ' + ', '.join(targets))
     for service in services:
         run(['docker', 'image', 'inspect', feature['services'][service]['image']], stdout=subprocess.DEVNULL)
+    ui.section('Deployment')
+    ui.step('Checking network aliases and starting required dependencies')
     check_redirects(state, targets)
     start_dependencies(state)
+    ui.step('Replacing selected application containers and waiting for health checks (up to 300s)')
     run(compose(state) + ['up', '-d', '--no-deps', '--wait', '--wait-timeout', '300', '--pull', 'never', *services])
     start_dependencies(state, after_apps=True)
     if 'web' in targets:
@@ -734,12 +768,89 @@ def deploy(state, targets):
     summary(state, targets)
 
 
+def share_images(args, state, lock):
+    import feature_share
+    import windows_share
+
+    address, network = args.sharing_interface
+    share_lock = (STATE / 'sharing.lock').open('w')
+    try:
+        fcntl.flock(share_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise ValueError('A share is already running. Use Stop Sharing before starting another.') from None
+    stop_file = STATE / 'sharing.stop'
+    stop_file.unlink(missing_ok=True)
+    try:
+        with tempfile.TemporaryDirectory(prefix='sharing-', dir=STATE) as temporary:
+            directory = Path(temporary)
+            ui.section('Prepare Shared Bundle')
+            ui.step('Generating a temporary TLS certificate')
+            fingerprint = feature_share.certificate(directory, run)
+            builds = json.loads((STATE / 'build.json').read_text())
+            feature_share.export_bundle(directory, builds, args.targets, args.release, run, output)
+            lock.close()
+            with windows_share.expose(address, args.share_port, args.share_minutes, stop_file) as lan_address:
+                feature_share.serve(directory, address, network, args.share_port, args.share_minutes,
+                                    fingerprint, stop_file, advertise_address=lan_address)
+    finally:
+        stop_file.unlink(missing_ok=True)
+        share_lock.close()
+
+
+def stop_sharing():
+    if not STATE.exists():
+        ui.info('No active share in this state directory')
+        return
+    with (STATE / 'sharing.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            ui.info('No active share in this state directory')
+        except BlockingIOError:
+            (STATE / 'sharing.stop').touch(mode=0o600)
+            ui.success('Stop requested. The sharing task will close access and remove its temporary bundle.')
+
+
+def pull_shared(args, state):
+    import feature_share
+
+    ui.section('Receive Shared Build')
+    link = args.share_link or ui.prompt('Paste the complete share link from the giver')
+    ui.step('Connecting securely and validating the shared build')
+    feature_share.parse_link(link)
+    with tempfile.TemporaryDirectory(prefix='pull-', dir=STATE) as temporary:
+        manifest, targets = feature_share.receive(link, Path(temporary), args.release,
+                                                  args.targets if args.only or args.exclude else None, output, run)
+        images = {}
+        import_id = uuid.uuid4().hex[:12]
+        for key in targets:
+            image = f'local/{state["project"]}-{key}:shared-{import_id}'
+            run(['docker', 'image', 'tag', manifest['images'][key]['id'], image])
+            images[key] = image
+        previous_path = STATE / 'build.json'
+        previous = json.loads(previous_path.read_text()) if previous_path.exists() else {}
+        repositories = {source: manifest['repositories'][source] for key in targets
+                        for source in ([key, 'client'] if key == 'ui' else [key])}
+        combined = {**previous.get('images', {}), **images}
+        build_info = {'images': combined, 'repositories': {**previous.get('repositories', {}), **repositories},
+                      'build_id': previous.get('build_id'),
+                      'releases': {**previous.get('releases', {}), **{key: args.release for key in targets}}}
+        feature = {'services': {SERVICES[key]: {'image': image, 'pull_policy': 'never'}
+                                for key, image in combined.items()}}
+        save(STATE / 'build.json', build_info)
+        save(STATE / 'feature.json', feature)
+
+    ui.success(f'Imported {", ".join(targets)}. Nothing deployed.')
+    ui.detail('Next', f'Run Deploy for {", ".join(targets)}')
+    ui.info('Restore uses this computer\'s original cluster images.')
+
+
 def main():
     """Parse commands, load private configuration, lock state and enforce daemon identity."""
     global STATE
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['prepare', 'paths', 'build', 'up', 'restore', 'stop', 'status', 'clean'])
+    parser.add_argument('command', choices=['prepare', 'paths', 'build', 'build-share', 'share', 'pull-shared',
+                                           'stop-sharing', 'up', 'restore', 'stop', 'status', 'clean'])
     parser.add_argument('--env-file', type=Path, help='Configuration file; defaults to .env beside this script')
     parser.add_argument('--source', default='hrbc1')
     parser.add_argument('--release', default=None, help='Expected cluster release; defaults to FEATURE_ENV_RELEASE, then automatic detection')
@@ -750,10 +861,18 @@ def main():
     parser.add_argument('--jobs', type=int, choices=range(1, 5), default=2)
     parser.add_argument('--dry-run', action='store_true', help='clean: list what would be removed without removing it')
     parser.add_argument('--keep-builds', type=int, default=2, help='clean: most recent build snapshots to retain per target selection')
+    parser.add_argument('--share-address', help='Sharing: private IPv4 address assigned to the LAN interface')
+    parser.add_argument('--share-port', type=int, default=8443, help='Sharing: listening port (default: 8443)')
+    parser.add_argument('--share-minutes', type=int, default=60, help='Sharing: lifetime in minutes (1-1440; default: 60)')
+    parser.add_argument('--share-link', help='Pull: complete secret link; omit to paste it at the terminal prompt')
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument('--only', nargs='+', choices=TARGETS, help='Build/manage only these repositories or runtime targets')
     selection.add_argument('--exclude', nargs='+', choices=TARGETS, help='Leave these repositories or runtime targets to Dev Containers')
     args = parser.parse_args()
+    args.targets = select_targets(args.only, args.exclude)
+    ui.heading(args.command, args.targets)
+    if not 1024 <= args.share_port <= 65535 or not 1 <= args.share_minutes <= 1440:
+        parser.error('--share-port must be 1024-65535 and --share-minutes must be 1-1440')
     env_file = (args.env_file or BUNDLE / '.env').expanduser().resolve()
     if not env_file.is_file():
         raise ValueError(f'Environment file not found: {env_file}. Create and edit it using the README configuration before running this command.')
@@ -761,15 +880,27 @@ def main():
     STATE = Path(os.environ.get('FEATURE_ENV_STATE_DIR', str(BUNDLE / '.feature-env'))).expanduser().resolve()
     if args.release is None:
         args.release = os.environ.get('FEATURE_ENV_RELEASE')
-    print(f'Configuration: {env_file if env_file.is_file() else "process environment/defaults"}\nState: {STATE}', flush=True)
+    ui.section('Configuration')
+    ui.detail('Config file', env_file)
+    ui.detail('State', STATE)
     if args.command == 'prepare' and (args.only or args.exclude):
         parser.error('prepare captures the whole cluster; selection applies to paths/build/up/restore/stop/status')
-    args.targets = select_targets(args.only, args.exclude)
+    if args.command == 'stop-sharing':
+        stop_sharing()
+        ui.finish()
+        return
+    if args.command in {'share', 'build-share'}:
+        import feature_share
+
+        args.sharing_interface = feature_share.check_listener(args.share_address, args.share_port)
     if args.command == 'paths':
         state = json.loads((STATE / 'state.json').read_text()) if (STATE / 'state.json').exists() else {}
         paths = repository_paths(state, args.targets, args.repos)
-        print(json.dumps({key: {'environment_variable': REPO_ENV[REPOS[key]], 'path': str(repo)}
-                          for key, repo in paths.items()}, indent=2))
+        ui.section('Resolved Repository Paths')
+        for key, repo in paths.items():
+            ui.detail(key, repo)
+            ui.detail('Setting', REPO_ENV[REPOS[key]])
+        ui.finish()
         return
     STATE.parent.mkdir(parents=True, exist_ok=True)
     lock = STATE.with_name(STATE.name + '.lock').open('w')
@@ -777,19 +908,22 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         raise ValueError('Another feature-env command is running')
-    if args.command in {'prepare', 'build', 'up', 'restore'}:
+    if args.command in {'prepare', 'build', 'build-share', 'share', 'pull-shared', 'up', 'restore'}:
         state_path = STATE / 'state.json'
         project = json.loads(state_path.read_text())['project'] if state_path.exists() else args.source
         args.release = cluster_release(project, args.release)
-        print(f'Cluster release: {args.release}', flush=True)
+        ui.detail('Release', args.release)
     if args.command == 'prepare':
+        ui.step('Capturing the existing cluster Restore baseline')
         prepare(args)
+        ui.finish()
         return
-    if args.command == 'build' and not (STATE / 'state.json').exists():
-        repository_paths({}, args.targets, args.repos)
+    if args.command in {'build', 'build-share', 'pull-shared'} and not (STATE / 'state.json').exists():
+        if args.command != 'pull-shared':
+            repository_paths({}, args.targets, args.repos)
         if (STATE / 'normal.json').exists():
             raise ValueError('Incomplete preparation: normal.json exists without state.json; review before retrying')
-        print(f'First build: preparing existing cluster {args.source} (release {args.release}). No containers will be replaced.', flush=True)
+        ui.step(f'Preparing existing cluster {args.source} (release {args.release}). No containers will be replaced.')
         prepare(args)
     if not (STATE / 'state.json').is_file():
         raise ValueError(
@@ -803,30 +937,49 @@ def main():
     if state['project'] != state['source']:
         raise ValueError('State targets a separate project; prepare existing-cluster state first')
     heal_stray_renames(state)
-    if args.command in {'build', 'up', 'restore'}:
+    if args.command in {'build', 'build-share', 'pull-shared', 'up', 'restore'}:
         state = ensure_current_baseline(args, state)
-    if args.command == 'build':
+    if args.command in {'build', 'build-share'}:
         build(args, state)
+        if args.command == 'build-share':
+            share_images(args, state, lock)
+    elif args.command == 'share':
+        check_build_release(args.targets, args.release)
+        share_images(args, state, lock)
+    elif args.command == 'pull-shared':
+        pull_shared(args, state)
     elif args.command == 'up':
         check_build_release(args.targets, args.release)
         deploy(state, args.targets)
     elif args.command == 'restore':
         # Reuse the baseline without local image overrides; database contents are untouched.
+        ui.section('Restore')
+        ui.step('Checking aliases and restoring original images; database contents are untouched')
         check_redirects(state, args.targets)
         run(compose(state, False) + ['up', '-d', '--no-deps', '--wait', '--wait-timeout', '180', *[SERVICES[key] for key in args.targets]])
         if 'web' in args.targets:
             refresh_web_routing(state)
         restart_routing(state, args.targets)
+        summary(state, args.targets)
     elif args.command == 'stop':
+        ui.section('Stop Services')
+        ui.step(f'Stopping {", ".join(args.targets)} without changing configured images')
         run(compose(state, False) + ['stop', *[SERVICES[key] for key in args.targets]])
     elif args.command == 'clean':
         clean(state, args.targets, args.keep_builds, args.dry_run)
     else:
         summary(state, args.targets)
+    ui.finish()
 
 if __name__ == '__main__':
     try:
         main()
-    except (ValueError, OSError, subprocess.CalledProcessError) as exc:
-        print(f'feature-env: {exc}', file=sys.stderr)
+    except KeyboardInterrupt:
+        ui.stream = sys.stderr
+        ui.warning('Task cancelled. Operations already completed are not automatically rolled back.')
+        sys.exit(130)
+    except (ValueError, OSError, EOFError, subprocess.CalledProcessError) as exc:
+        ui.stream = sys.stderr
+        ui.line()
+        ui.error(str(exc))
         sys.exit(1)

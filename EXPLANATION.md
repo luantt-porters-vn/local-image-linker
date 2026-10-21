@@ -1,5 +1,33 @@
 # local-image-linker: Repository Explanation
 
+## LAN Sharing Addition (2026-10-21)
+
+The CLI now also supports `build-share`, `share`, `pull-shared`, and
+`stop-sharing`, exposed as VS Code tasks and extension commands. Build & Share
+exports selected successful images, starts a temporary HTTPS server on one
+private IPv4 interface, and displays a secret link with a pinned certificate
+fingerprint. Pull Shared validates and loads that bundle without building or
+requiring source repositories; Deploy remains a separate action. The receiver
+captures and retains its own Restore baseline.
+
+[src/feature_share.py](src/feature_share.py) owns LAN/interface diagnostics,
+temporary TLS certificates, restricted bundle serving, certificate pinning,
+checksums and platform/release validation. The existing CLI owns cluster state
+and image registration. The sharing server releases the cluster lock after
+export, expires automatically, and can be stopped independently. It never exposes
+the Docker socket or a general file browser. Host OpenSSL is used when available;
+otherwise a Docker OpenSSL helper generates the certificate without a manual
+package installation. Actual peer reachability still depends on firewall,
+Wi-Fi isolation and WSL/container networking. WSL NAT sharing now offers managed
+Windows forwarding with explicit UAC approval: the Windows helper scopes access
+to the selected LAN, advertises its address, and removes owned rules on stop or
+heartbeat loss. Native Linux does not change privileged settings. See
+[src/windows_share.py](src/windows_share.py) and
+[src/windows-share.ps1](src/windows-share.ps1).
+
+See [README.md](README.md) for the current sharing workflow and troubleshooting.
+The historical implementation excerpts below predate this addition.
+
 This guide explains the checked-out source as inspected on 2026-09-16. Code blocks marked **Source** are exact excerpts, including the repository's original comments; explanations appear below them. Directory trees, flow maps, and explicitly labeled examples are explanatory illustrations.
 
 The guide is based on reading the implementation. No build, deployment, restore, or Docker health check was executed while writing it.
