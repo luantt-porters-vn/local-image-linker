@@ -13,8 +13,20 @@ ENV PATH=/opt/feature-java/bin:${PATH}
 COPY api/ /src/
 WORKDIR /src/api_source
 # Publish shared modules in dependency order before assembling the consuming WAR.
-RUN --mount=type=cache,target=/root/.gradle \
-    set -eu; for project in UtilGeneral Core CoreLegacy HrbcDb HrbcGeneral; do \
+# Validate persisted wrapper downloads before reuse; keep dependency caches intact.
+# Lock this cache so another build cannot download while the archives are checked.
+RUN --mount=type=cache,target=/root/.gradle,sharing=locked \
+    set -eu; \
+    if [ -d /root/.gradle/wrapper/dists ]; then \
+      find /root/.gradle/wrapper/dists -type f -name 'gradle-*.zip' \
+        -exec sh -eu -c 'for archive do \
+          if ! jar tf "$archive" >/dev/null 2>&1; then \
+            echo "Removing invalid Gradle distribution: $archive"; \
+            rm -f "$archive" "$archive.ok"; \
+          fi; \
+        done' sh {} +; \
+    fi; \
+    for project in UtilGeneral Core CoreLegacy HrbcDb HrbcGeneral; do \
       (cd "$project" && bash ./gradlew --no-daemon --console=plain assemble publishMainPublicationToMavenLocal); \
     done; \
     cd PrivateAPI; bash ./gradlew --no-daemon --console=plain assemble; \
